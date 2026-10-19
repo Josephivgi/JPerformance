@@ -4,7 +4,7 @@ use winreg::RegKey;
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 
 const RUN: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const NAME: &str = "PerfLens";
+const NAME: &str = "JPerformance";
 
 fn command() -> std::io::Result<String> {
     Ok(format!("\"{}\" --collector", std::env::current_exe()?.display()))
@@ -29,9 +29,21 @@ pub fn set_enabled(on: bool) -> std::io::Result<()> {
     }
 }
 
-/// Keeps the Run entry pointing at this exe if the app was moved.
+/// Name used before the app was renamed to JPerformance.
+const LEGACY_NAME: &str = "PerfLens";
+
+/// Keeps the Run entry pointing at this exe if the app was moved, and carries
+/// over a sign-in entry made under the old name.
 pub fn refresh_path() {
-    if is_enabled() {
+    let legacy = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(RUN, KEY_READ | KEY_WRITE)
+        .ok()
+        .filter(|k| k.get_value::<String, _>(LEGACY_NAME).is_ok());
+    if let Some(key) = &legacy {
+        if set_enabled(true).is_ok() {
+            let _ = key.delete_value(LEGACY_NAME);
+        }
+    } else if is_enabled() {
         let _ = set_enabled(true);
     }
 }

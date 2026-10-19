@@ -50,7 +50,7 @@ pub fn known(app: &str) -> Option<&'static str> {
         "virtualboxvm" | "vboxheadless" => "A running VirtualBox virtual machine.",
         "nvcontainer" | "nvdisplay.container" => "NVIDIA driver services.",
         "obs64" => "OBS Studio. Recording and streaming are CPU and GPU heavy.",
-        "perflens" => "PerfLens itself.",
+        "jperformance" => "JPerformance itself.",
         _ => return None,
     })
 }

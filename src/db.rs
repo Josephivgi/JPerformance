@@ -431,6 +431,15 @@ pub fn weekday_hour_cpu(conn: &Connection, from: i64, to: i64) -> Result<[[Optio
     Ok(grid)
 }
 
+/// Number of minutes with per-app data between `from` and `to`.
+pub fn minutes_recorded(conn: &Connection, from: i64, to: i64) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(DISTINCT minute) FROM app_minutes WHERE minute >= ?1 AND minute <= ?2",
+        params![from, to],
+        |r| r.get(0),
+    )
+}
+
 pub struct Coverage {
     pub first: Option<i64>,
     pub last: Option<i64>,

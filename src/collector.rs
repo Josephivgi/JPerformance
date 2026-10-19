@@ -1,4 +1,4 @@
-//! Background collector. Runs as `PerfLens.exe --collector`, samples the whole
+//! Background collector. Runs as `JPerformance.exe --collector`, samples the whole
 //! system every few seconds and rolls per-app usage up into one row per minute.
 
 use crate::{db, describe, paths};

@@ -17,13 +17,13 @@ fn attach_console() {
     }
 }
 
-/// `PerfLens.exe --report [hours]` prints the same findings the Insights page shows.
+/// `JPerformance.exe --report [hours]` prints the same findings the Insights page shows.
 fn report(hours: i64) -> Result<(), String> {
     attach_console();
     let conn = db::open(&paths::db_path()).map_err(|e| e.to_string())?;
     let to = chrono::Utc::now().timestamp();
     let from = to - hours * 3600;
-    println!("\nPerfLens report, last {hours} h  ({})", paths::db_path().display());
+    println!("\nJPerformance report, last {hours} h  ({})", paths::db_path().display());
     println!("Collector running: {}", collector::is_running());
     for i in insights::compute(&conn, from, to).map_err(|e| e.to_string())? {
         println!("\n[{:?}] {}\n    {}", i.severity, i.title, i.detail);
@@ -43,6 +43,7 @@ fn report(hours: i64) -> Result<(), String> {
 }
 
 fn main() {
+    paths::migrate_legacy();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--collector") => {

@@ -1,11 +1,11 @@
 [package]
-name = "perflens"
+name = "jperformance"
 version = "0.1.0"
 edition = "2024"
 description = "Track Windows app performance over time"
 
 [[bin]]
-name = "PerfLens"
+name = "JPerformance"
 path = "src/main.rs"
 
 [dependencies]

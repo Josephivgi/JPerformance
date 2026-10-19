@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 pub fn run() -> Result<(), String> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("PerfLens")
+            .with_title("JPerformance")
             .with_inner_size([1200.0, 800.0])
             .with_min_inner_size([900.0, 600.0]),
         ..Default::default()
     };
-    eframe::run_native("PerfLens", options, Box::new(|cc| Ok(Box::new(App::new(cc)?))))
+    eframe::run_native("JPerformance", options, Box::new(|cc| Ok(Box::new(App::new(cc)?))))
         .map_err(|e| e.to_string())
 }
 
@@ -69,11 +69,36 @@ enum AppSort {
     Io,
 }
 
+/// A clicked point in time and what was happening then.
+struct Moment {
+    from: i64,
+    to: i64,
+    sys: Option<db::SysPoint>,
+    apps: Vec<db::AppSummary>,
+    minutes: i64,
+}
+
+impl Moment {
+    fn len(&self) -> i64 {
+        self.to - self.from + 1
+    }
+    fn center(&self) -> i64 {
+        self.from + self.len() / 2
+    }
+    fn label(&self) -> String {
+        if self.len() <= 60 {
+            fmt::day_time(self.from)
+        } else {
+            format!("{} to {}", fmt::day_time(self.from), fmt::local(self.to + 1).format("%H:%M"))
+        }
+    }
+}
+
 struct App {
     conn: Connection,
     page: Page,
     range: Range,
-    marker: Option<i64>,
+    moment: Option<Moment>,
 
     last_live: Option<Instant>,
     last_range: Option<Instant>,
@@ -121,7 +146,7 @@ impl App {
             conn,
             page: Page::Now,
             range: Range::H24,
-            marker: None,
+            moment: None,
             last_live: None,
             last_range: None,
             range_dirty: true,
@@ -200,6 +225,145 @@ impl App {
     }
 }
 
+impl App {
+    /// Selects the `bucket`-second window containing `ts` (at least one minute).
+    fn select_at(&mut self, ts: i64, bucket: i64) {
+        let bucket = bucket.max(60);
+        let from = ts - ts.rem_euclid(bucket);
+        self.select_window(from, from + bucket - 1);
+    }
+
+    fn select_window(&mut self, from: i64, to: i64) {
+        let r: db::Result<Moment> = (|| {
+            let sys = db::system_series(&self.conn, from, to, to - from + 1)?.into_iter().next();
+            let mut apps = db::app_summaries(&self.conn, from - from.rem_euclid(60), to)?;
+            apps.sort_by(|a, b| b.cpu_load.total_cmp(&a.cpu_load));
+            let minutes = db::minutes_recorded(&self.conn, from - from.rem_euclid(60), to)?;
+            Ok(Moment { from, to, sys, apps, minutes })
+        })();
+        match r {
+            Ok(m) => self.moment = Some(m),
+            Err(e) => self.error = Some(format!("Could not read data: {e}")),
+        }
+    }
+
+    fn moment_panel(&mut self, ui: &mut Ui, t: &Tokens) {
+        let Some(m) = &self.moment else { return };
+        let (from, len) = (m.from, m.len());
+        let mut close = false;
+        let mut shift = 0i64;
+        let mut open_app = None;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("At this time").size(16.0).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+            });
+        });
+        ui.label(RichText::new(m.label()).color(t.text_2));
+        ui.horizontal(|ui| {
+            if ui.button("Earlier").clicked() {
+                shift = -len;
+            }
+            let later_ok = from + len <= chrono::Utc::now().timestamp();
+            if ui.add_enabled(later_ok, egui::Button::new("Later")).clicked() {
+                shift = len;
+            }
+        });
+        ui.add_space(theme::GAP);
+
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            let Some(p) = &m.sys else {
+                ui.label(RichText::new("Nothing was recorded at this time. Background tracking may have been off.").color(t.muted));
+                return;
+            };
+            egui::Grid::new("moment_stats").num_columns(2).spacing(vec2(16.0, 6.0)).show(ui, |ui| {
+                ui.label(RichText::new("CPU").color(t.text_2));
+                ui.label(if len > 60 {
+                    format!("{} average, {} peak", fmt::pct(p.cpu), fmt::pct(p.cpu_max))
+                } else {
+                    format!("{} average", fmt::pct(p.cpu))
+                });
+                ui.end_row();
+                ui.label(RichText::new("Memory").color(t.text_2));
+                ui.label(format!("{} ({})", fmt::pct(p.mem_pct), fmt::bytes(p.mem_used)));
+                ui.end_row();
+                ui.label(RichText::new("Disk and file I/O").color(t.text_2));
+                ui.label(fmt::rate(p.io_rate));
+                ui.end_row();
+                ui.label(RichText::new("Network").color(t.text_2));
+                ui.label(fmt::rate(p.net_rate));
+                ui.end_row();
+            });
+
+            if m.apps.is_empty() {
+                ui.add_space(theme::GAP);
+                ui.label(RichText::new("No per-app data for this time. Apps are saved once a minute.").color(t.muted));
+                return;
+            }
+            let minutes = m.minutes.max(1) as f64;
+            let max_cpu = m.apps.first().map(|a| a.cpu_load).unwrap_or(0.0).max(f64::EPSILON);
+
+            section(ui, t, "Using the most CPU");
+            for a in m.apps.iter().filter(|a| a.cpu_load * 100.0 / minutes >= 0.1).take(8) {
+                let share = a.cpu_load * 100.0 / minutes;
+                if moment_row(ui, t, &a.app, a.description.as_deref(), &fmt::pct(share), a.cpu_load / max_cpu) {
+                    open_app = Some(a.app.clone());
+                }
+            }
+
+            let mut by_mem: Vec<&db::AppSummary> = m.apps.iter().collect();
+            by_mem.sort_by(|a, b| b.mem_avg.total_cmp(&a.mem_avg));
+            let max_mem = by_mem.first().map(|a| a.mem_avg).unwrap_or(0.0).max(f64::EPSILON);
+            section(ui, t, "Using the most memory");
+            for a in by_mem.into_iter().take(6) {
+                if moment_row(ui, t, &a.app, a.description.as_deref(), &fmt::bytes(a.mem_avg), a.mem_avg / max_mem) {
+                    open_app = Some(a.app.clone());
+                }
+            }
+        });
+
+        if close {
+            self.moment = None;
+        } else if shift != 0 {
+            self.select_window(from + shift, from + shift + len - 1);
+        }
+        if let Some(app) = open_app {
+            self.selected_app = Some(app);
+            self.page = Page::Apps;
+            self.range_dirty = true;
+        }
+    }
+}
+
+/// One app line in the moment panel. Returns true when clicked.
+fn moment_row(ui: &mut Ui, t: &Tokens, app: &str, desc: Option<&str>, value: &str, frac: f64) -> bool {
+    let resp = ui
+        .vertical(|ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(describe::display_name(app, desc)).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(value);
+                });
+            });
+            let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 6.0), Sense::hover());
+            ui.painter().rect_filled(rect, 3.0, t.surface_alt);
+            let mut fill = rect;
+            fill.set_width((rect.width() * frac as f32).max(2.0));
+            ui.painter().rect_filled(fill, 3.0, t.accent);
+            ui.label(RichText::new(describe::explain(app, desc)).small().color(t.text_2));
+            ui.add_space(4.0);
+        })
+        .response
+        .interact(Sense::click())
+        .on_hover_text("Open in Apps");
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp.clicked()
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.refresh();
@@ -211,6 +375,14 @@ impl eframe::App for App {
             .resizable(false)
             .frame(egui::Frame::new().fill(t.surface).inner_margin(egui::Margin::same(14)).stroke(Stroke::new(1.0, t.border)))
             .show(ui, |ui| self.nav(ui, &t));
+
+        if self.moment.is_some() {
+            egui::Panel::right("moment")
+                .exact_size(340.0)
+                .resizable(false)
+                .frame(egui::Frame::new().fill(t.surface).inner_margin(egui::Margin::same(16)).stroke(Stroke::new(1.0, t.border)))
+                .show(ui, |ui| self.moment_panel(ui, &t));
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(t.bg).inner_margin(egui::Margin::symmetric(24, 18)))
@@ -262,7 +434,7 @@ impl App {
                 if ui.selectable_label(self.range == r, r.label()).clicked() && self.range != r {
                     self.range = r;
                     self.range_dirty = true;
-                    self.marker = None;
+                    self.moment = None;
                 }
             }
         });
@@ -296,7 +468,8 @@ struct ChartSpec<'a> {
 }
 
 /// A single-series time chart: one line, one y axis, hover readout.
-fn time_chart(ui: &mut Ui, t: &Tokens, spec: ChartSpec, points: &[(i64, f64)]) {
+/// Returns the time the user clicked, if any.
+fn time_chart(ui: &mut Ui, t: &Tokens, spec: ChartSpec, points: &[(i64, f64)]) -> Option<i64> {
     theme::card(t).show(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(RichText::new(spec.title).strong());
@@ -310,7 +483,7 @@ fn time_chart(ui: &mut Ui, t: &Tokens, spec: ChartSpec, points: &[(i64, f64)]) {
             ui.add_space(8.0);
             ui.label(RichText::new("No samples in this range yet.").color(t.muted));
             ui.add_space(8.0);
-            return;
+            return None;
         }
         let value_fmt = spec.value_fmt;
         let mut plot = Plot::new(spec.id)
@@ -338,6 +511,9 @@ fn time_chart(ui: &mut Ui, t: &Tokens, spec: ChartSpec, points: &[(i64, f64)]) {
             plot = plot.include_x(a as f64).include_x(b as f64);
         }
         plot.show(ui, |p| {
+            if p.response().hovered() {
+                p.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
             for seg in segments(points, spec.gap) {
                 p.line(
                     Line::new(spec.title, PlotPoints::from(seg))
@@ -348,10 +524,13 @@ fn time_chart(ui: &mut Ui, t: &Tokens, spec: ChartSpec, points: &[(i64, f64)]) {
                 );
             }
             if let Some(m) = spec.marker {
-                p.vline(VLine::new("marker", m as f64).color(t.text_2).width(1.0));
+                p.vline(VLine::new("marker", m as f64).color(t.text_2).width(1.5));
             }
-        });
-    });
+            if p.response().clicked() { p.pointer_coordinate().map(|c| c.x as i64) } else { None }
+        })
+        .inner
+    })
+    .inner
 }
 
 fn pct_fmt(v: f64) -> String {
@@ -369,7 +548,7 @@ fn bytes_fmt(v: f64) -> String {
 impl App {
     fn nav(&mut self, ui: &mut Ui, t: &Tokens) {
         ui.add_space(4.0);
-        ui.label(RichText::new("PerfLens").size(18.0).strong().color(t.text));
+        ui.label(RichText::new("JPerformance").size(18.0).strong().color(t.text));
         ui.label(RichText::new("App performance over time").small().color(t.muted));
         ui.add_space(18.0);
         for (page, label) in [
@@ -443,6 +622,8 @@ impl App {
         let cpu: Vec<(i64, f64)> = self.recent.iter().map(|p| (p.ts, p.cpu)).collect();
         let mem: Vec<(i64, f64)> = self.recent.iter().map(|p| (p.ts, p.mem_pct)).collect();
         section(ui, t, "Last 15 minutes");
+        ui.label(RichText::new("Click a chart to see which apps were running at that minute.").small().color(t.muted));
+        let mut clicked = None;
         ui.columns(2, |cols| {
             let spec = |id, title| ChartSpec {
                 id,
@@ -452,11 +633,15 @@ impl App {
                 height: 150.0,
                 gap: 3 * self.interval.max(1) + 5,
                 x_range: Some((now - 15 * 60, now)),
-                marker: None,
+                marker: self.moment.as_ref().map(Moment::center),
             };
-            time_chart(&mut cols[0], t, spec("now_cpu", "CPU"), &cpu);
-            time_chart(&mut cols[1], t, spec("now_mem", "Memory"), &mem);
+            let a = time_chart(&mut cols[0], t, spec("now_cpu", "CPU"), &cpu);
+            let b = time_chart(&mut cols[1], t, spec("now_mem", "Memory"), &mem);
+            clicked = a.or(b);
         });
+        if let Some(ts) = clicked {
+            self.select_at(ts, 60);
+        }
 
         section(ui, t, "What is using your PC");
         ui.horizontal(|ui| {
@@ -510,7 +695,7 @@ impl App {
     }
 
     fn page_history(&mut self, ui: &mut Ui, t: &Tokens) {
-        heading(ui, t, "History", "How hard your PC worked over time. Hover a chart to read exact values.");
+        heading(ui, t, "History", "How hard your PC worked over time. Hover a chart to read values, click it to see which apps were running then.");
         self.range_picker(ui);
         let now = chrono::Utc::now().timestamp();
         let x_range = Some((now - self.range.secs(), now));
@@ -522,15 +707,28 @@ impl App {
             ("h_io", "Disk and file I/O", rate_fmt, None, series(|p| p.io_rate)),
             ("h_net", "Network", rate_fmt, None, series(|p| p.net_rate)),
         ];
+        let marker = self.moment.as_ref().map(Moment::center);
+        let mut clicked = None;
         for (id, title, value_fmt, y_max, pts) in charts {
-            time_chart(ui, t, ChartSpec { id, title, value_fmt, y_max, height: 150.0, gap, x_range, marker: self.marker }, &pts);
+            let c = time_chart(ui, t, ChartSpec { id, title, value_fmt, y_max, height: 150.0, gap, x_range, marker }, &pts);
+            clicked = clicked.or(c);
             ui.add_space(theme::GAP / 2.0);
+        }
+        if let Some(ts) = clicked {
+            self.select_at(ts, self.range.bucket());
         }
 
         section(ui, t, "Busy times by day and hour");
-        ui.label(RichText::new("Average CPU for each hour of each weekday in this range. Darker means busier.").color(t.text_2));
+        ui.label(
+            RichText::new("Average CPU for each hour of each weekday in this range. Darker means busier. Click a square to see the most recent time it covers.")
+                .color(t.text_2),
+        );
         ui.add_space(6.0);
-        theme::card(t).show(ui, |ui| heatmap(ui, t, &self.heat));
+        if let Some((day, hour)) = theme::card(t).show(ui, |ui| heatmap(ui, t, &self.heat)).inner {
+            if let Some(from) = latest_weekday_hour(day, hour, self.range.secs()) {
+                self.select_window(from, from + 3599);
+            }
+        }
     }
 
     fn page_apps(&mut self, ui: &mut Ui, t: &Tokens) {
@@ -572,10 +770,16 @@ impl App {
             let cpu: Vec<(i64, f64)> = self.app_series.iter().map(|p| (p.ts, p.cpu)).collect();
             let mem: Vec<(i64, f64)> = self.app_series.iter().map(|p| (p.ts, p.mem)).collect();
             ui.add_space(theme::GAP / 2.0);
+            let mut clicked = None;
             ui.columns(2, |cols| {
-                time_chart(&mut cols[0], t, ChartSpec { id: "app_cpu", title: "CPU", value_fmt: pct_fmt, y_max: None, height: 140.0, gap, x_range, marker: None }, &cpu);
-                time_chart(&mut cols[1], t, ChartSpec { id: "app_mem", title: "Memory", value_fmt: bytes_fmt, y_max: None, height: 140.0, gap, x_range, marker: None }, &mem);
+                let marker = self.moment.as_ref().map(Moment::center);
+                let a = time_chart(&mut cols[0], t, ChartSpec { id: "app_cpu", title: "CPU", value_fmt: pct_fmt, y_max: None, height: 140.0, gap, x_range, marker }, &cpu);
+                let b = time_chart(&mut cols[1], t, ChartSpec { id: "app_mem", title: "Memory", value_fmt: bytes_fmt, y_max: None, height: 140.0, gap, x_range, marker }, &mem);
+                clicked = a.or(b);
             });
+            if let Some(ts) = clicked {
+                self.select_at(ts, self.range.bucket());
+            }
             ui.add_space(theme::GAP);
         }
 
@@ -685,7 +889,7 @@ impl App {
                 ui.label(RichText::new(&i.title).size(15.0).strong());
                 ui.label(RichText::new(&i.detail).color(t.text_2));
                 if let Some(at) = i.at {
-                    if ui.link("Show on the history charts").clicked() {
+                    if ui.link("See what was running then").clicked() {
                         jump = Some(at);
                     }
                 }
@@ -693,7 +897,7 @@ impl App {
             ui.add_space(theme::GAP / 2.0);
         }
         if let Some(at) = jump {
-            self.marker = Some(at);
+            self.select_at(at, self.range.bucket());
             self.page = Page::History;
         }
     }
@@ -810,7 +1014,9 @@ impl App {
 }
 
 /// Weekday by hour grid. Rows start on Monday.
-fn heatmap(ui: &mut Ui, t: &Tokens, grid: &[[Option<f64>; 24]; 7]) {
+/// Returns the (weekday, hour) the user clicked, weekday 0 = Sunday.
+fn heatmap(ui: &mut Ui, t: &Tokens, grid: &[[Option<f64>; 24]; 7]) -> Option<(usize, usize)> {
+    let mut clicked = None;
     const DAYS: [(&str, usize); 7] = [("Mon", 1), ("Tue", 2), ("Wed", 3), ("Thu", 4), ("Fri", 5), ("Sat", 6), ("Sun", 0)];
     let max = grid.iter().flatten().flatten().cloned().fold(0.0f64, f64::max).max(1.0);
     let label_w = 40.0;
@@ -826,7 +1032,7 @@ fn heatmap(ui: &mut Ui, t: &Tokens, grid: &[[Option<f64>; 24]; 7]) {
         ui.painter().text(egui::pos2(x, rect.center().y), egui::Align2::LEFT_CENTER, format!("{h:02}"), painter_font.clone(), t.muted);
     }
     for (name, d) in DAYS {
-        let (rect, resp) = ui.allocate_exact_size(vec2(label_w + 24.0 * (cell + 2.0), row_h), Sense::hover());
+        let (rect, resp) = ui.allocate_exact_size(vec2(label_w + 24.0 * (cell + 2.0), row_h), Sense::click());
         ui.painter().text(egui::pos2(rect.left(), rect.center().y), egui::Align2::LEFT_CENTER, name, painter_font.clone(), t.text_2);
         let mut hovered = None;
         for h in 0..24 {
@@ -843,6 +1049,10 @@ fn heatmap(ui: &mut Ui, t: &Tokens, grid: &[[Option<f64>; 24]; 7]) {
             }
         }
         if let Some(h) = hovered {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            if resp.clicked() {
+                clicked = Some((d, h));
+            }
             let text = match grid[d][h] {
                 Some(v) => format!("{name} {h:02}:00 to {:02}:00\nAverage CPU {}", (h + 1) % 24, fmt::pct(v)),
                 None => format!("{name} {h:02}:00\nNo data"),
@@ -866,4 +1076,20 @@ fn heatmap(ui: &mut Ui, t: &Tokens, grid: &[[Option<f64>; 24]; 7]) {
         ui.painter().rect_filled(sw, 2.0, t.surface_alt);
         ui.label(RichText::new("no data").small().color(t.muted));
     });
+    clicked
+}
+
+/// Start of the most recent hour within `range_secs` that falls on local `weekday` (0 = Sunday) and `hour`.
+fn latest_weekday_hour(weekday: usize, hour: usize, range_secs: i64) -> Option<i64> {
+    use chrono::{Datelike, Timelike};
+    let now = chrono::Utc::now().timestamp();
+    let mut ts = now;
+    while now - ts <= range_secs + 3600 {
+        let l = fmt::local(ts);
+        if l.weekday().num_days_from_sunday() as usize == weekday && l.hour() as usize == hour {
+            return Some(ts - (l.minute() as i64) * 60 - l.second() as i64);
+        }
+        ts -= 3600;
+    }
+    None
 }
