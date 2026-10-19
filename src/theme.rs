@@ -12,7 +12,6 @@ pub struct Tokens {
     pub text_2: Color32,
     pub muted: Color32,
     pub accent: Color32,
-    pub on_accent: Color32,
     pub good: Color32,
     pub warning: Color32,
     pub critical: Color32,
@@ -34,7 +33,6 @@ pub const LIGHT: Tokens = Tokens {
     text_2: hex(0x52514e),
     muted: hex(0x7c7b76),
     accent: hex(0x2a78d6),
-    on_accent: hex(0xffffff),
     good: hex(0x008300),
     warning: hex(0xb57a00),
     critical: hex(0xd23c3b),
@@ -51,7 +49,6 @@ pub const DARK: Tokens = Tokens {
     text_2: hex(0xc3c2b7),
     muted: hex(0x908f88),
     accent: hex(0x3987e5),
-    on_accent: hex(0xffffff),
     good: hex(0x2fa82f),
     warning: hex(0xe0a020),
     critical: hex(0xe66767),
@@ -109,9 +106,10 @@ fn visuals(t: &Tokens, dark: bool) -> Visuals {
     v.widgets.hovered.bg_fill = t.border;
     v.widgets.hovered.weak_bg_fill = t.border;
     v.widgets.hovered.bg_stroke = Stroke::new(1.0, t.muted);
-    v.widgets.active.bg_fill = t.accent;
-    v.widgets.active.weak_bg_fill = t.accent;
-    v.widgets.active.fg_stroke = Stroke::new(1.0, t.on_accent);
+    // egui draws strong text in the active color, so keep it on the main text color.
+    v.widgets.active.bg_fill = t.border;
+    v.widgets.active.weak_bg_fill = t.border;
+    v.widgets.active.fg_stroke = Stroke::new(1.0, t.text);
     v
 }
 
