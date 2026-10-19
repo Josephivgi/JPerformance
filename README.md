@@ -6,10 +6,11 @@ Task Manager shows the last minute. JPerformance keeps a history.
 
 ## What it does
 
-- **Right now**: live CPU, memory, disk and file I/O, and network, plus the apps using the most, with a short explanation of what each one is.
-- **History**: CPU, memory, I/O and network charts for the last hour up to 30 days, and a weekday by hour map of when your PC is busiest. Click any chart or map square to see which apps were running at that time.
+- **Right now**: live CPU, memory, disk and file I/O, network, and how many processes and apps are running, plus the apps using the most, with a short explanation of what each one is.
+- **History**: CPU, memory, I/O and network charts for the last hour up to 30 days, and a weekday by hour map of when your PC is busiest. Hover any chart to see which apps were behind that point, and click to keep that moment open. A processes chart shows how many were running at once.
 - **Apps**: every app ranked by CPU, memory or I/O over a time range. Click one to see its own usage over time.
 - **Insights**: plain findings such as your busiest hour and what caused it, long stretches of high CPU, times memory was nearly full, and which app used the most of each resource.
+- **Auto close** (off until you turn it on): closes apps you pick once they go unused for 10 minutes to 2 hours. Apps with open windows are only asked to close (like clicking X) if you allow it. Windows system processes are never closed. Every close is listed with the memory it freed.
 - **Background tracking**: a small helper process (`JPerformance.exe --collector`) keeps recording after you close the window. It can start when you sign in to Windows.
 
 All data stays on your PC in `%APPDATA%\JPerformance\jperformance.db` (SQLite). History older than 30 days is removed automatically; change that in Settings. History recorded under the old name (PerfLens) is copied over the first time JPerformance starts.

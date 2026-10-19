@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod autoclose;
 mod autostart;
 mod collector;
 mod db;

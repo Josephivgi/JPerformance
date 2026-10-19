@@ -1,7 +1,7 @@
 //! Background collector. Runs as `JPerformance.exe --collector`, samples the whole
 //! system every few seconds and rolls per-app usage up into one row per minute.
 
-use crate::{db, describe, paths};
+use crate::{autoclose, db, describe, paths};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
@@ -112,6 +112,10 @@ pub fn run() -> Result<(), String> {
     let mut last_prune = Instant::now() - Duration::from_secs(3600);
     let mut last_settings_check = Instant::now();
     let mut interval = db::setting_i64(&conn, db::KEY_INTERVAL, db::DEFAULT_INTERVAL).clamp(1, 60);
+    // Last time each app was in front or using at least 1% of one core.
+    let mut last_active: HashMap<String, i64> = HashMap::new();
+    let active_cpu = 1.0 / cores;
+    let mut last_autoclose = Instant::now();
 
     loop {
         if last_settings_check.elapsed() >= Duration::from_secs(5) {
@@ -160,6 +164,18 @@ pub fn run() -> Result<(), String> {
             }
         }
 
+        let foreground = autoclose::foreground_pid()
+            .and_then(|pid| sys.process(sysinfo::Pid::from_u32(pid)))
+            .map(|p| p.name().to_string_lossy().to_string());
+        last_active.retain(|name, _| apps.contains_key(name));
+        for (name, n) in &apps {
+            if n.cpu >= active_cpu || foreground.as_deref() == Some(name.as_str()) {
+                last_active.insert(name.clone(), ts);
+            } else {
+                last_active.entry(name.clone()).or_insert(ts);
+            }
+        }
+
         let (net_rx, net_tx) = nets
             .iter()
             .fold((0u64, 0u64), |(r, t), (_, n)| (r + n.received(), t + n.transmitted()));
@@ -174,6 +190,8 @@ pub fn run() -> Result<(), String> {
             net_rx,
             net_tx,
             interval_ms: elapsed_ms,
+            proc_count: apps.values().map(|n| n.procs).sum(),
+            app_count: apps.len() as i64,
         };
 
         let mut live: Vec<db::LiveApp> = apps
@@ -184,6 +202,7 @@ pub fn run() -> Result<(), String> {
                 mem: n.mem,
                 io_rate: n.io as f64 * 1000.0 / elapsed_ms as f64,
                 procs: n.procs,
+                last_active: last_active.get(name).copied().unwrap_or(ts),
             })
             .collect();
         live.sort_by(|a, b| b.cpu.total_cmp(&a.cpu).then(b.mem.cmp(&a.mem)));
@@ -193,6 +212,11 @@ pub fn run() -> Result<(), String> {
 
         if let Err(e) = db::write_sample(&mut conn, &sample, &top) {
             log(&format!("write_sample failed: {e}"));
+        }
+
+        if last_autoclose.elapsed() >= Duration::from_secs(30) {
+            last_autoclose = Instant::now();
+            autoclose::run(&conn, &sys, &mut last_active, foreground.as_deref(), ts);
         }
 
         // Per-minute rollup.
