@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS live_apps (
     io_rate  REAL    NOT NULL,
     procs    INTEGER NOT NULL,
     ts       INTEGER NOT NULL,
-    last_active INTEGER NOT NULL DEFAULT 0
+    last_active INTEGER NOT NULL DEFAULT 0,
+    titles   TEXT
 );
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
@@ -89,16 +90,33 @@ fn migrate(conn: &Connection) -> Result<()> {
         .collect::<Result<_>>()?;
     // live_apps only holds the latest sample, so it can be rebuilt freely.
     let live_ok = conn
-        .prepare("SELECT 1 FROM pragma_table_info('live_apps') WHERE name = 'last_active'")?
+        .prepare("SELECT 1 FROM pragma_table_info('live_apps') WHERE name = 'titles'")?
         .exists([])?;
     if !live_ok {
         conn.execute_batch(
             "DROP TABLE live_apps;
              CREATE TABLE live_apps (
                 app TEXT PRIMARY KEY, cpu REAL NOT NULL, mem INTEGER NOT NULL, io_rate REAL NOT NULL,
-                procs INTEGER NOT NULL, ts INTEGER NOT NULL, last_active INTEGER NOT NULL DEFAULT 0);",
+                procs INTEGER NOT NULL, ts INTEGER NOT NULL, last_active INTEGER NOT NULL DEFAULT 0, titles TEXT);",
         )?;
     }
+    let has_title = conn
+        .prepare("SELECT 1 FROM pragma_table_info('apps') WHERE name = 'window_title'")?
+        .exists([])?;
+    if !has_title {
+        conn.execute_batch("ALTER TABLE apps ADD COLUMN window_title TEXT")?;
+    }
+    // Apps that run on a shared runtime (Electron, Java, Python...) all have the
+    // runtime's description, so their taskbar window title names them better.
+    conn.execute_batch(
+        "DROP VIEW IF EXISTS app_names;
+         CREATE VIEW app_names AS
+         SELECT app, exe_path, window_title,
+                CASE WHEN window_title IS NOT NULL AND window_title <> ''
+                          AND (description IS NULL OR lower(description) IN ('electron', 'java(tm) platform se binary', 'openjdk platform binary', 'java', 'javaw', 'python', 'pythonw', 'node.js', 'node.js javascript runtime', 'nw.js', 'chromium', 'microsoft edge webview2', 'tauri app', 'cefsharp.browsersubprocess', 'qtwebengineprocess'))
+                     THEN window_title ELSE description END AS description
+         FROM apps;",
+    )?;
     let has_planned = conn
         .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'planned_end'")?
         .exists([])?;
@@ -182,6 +200,8 @@ pub struct LiveApp {
     pub mem: u64,
     pub io_rate: f64,
     pub procs: i64,
+    /// Taskbar window titles, joined with " | ".
+    pub titles: Option<String>,
 }
 
 pub fn write_sample(conn: &mut Connection, s: &SystemSample, live: &[LiveApp]) -> Result<()> {
@@ -207,10 +227,10 @@ pub fn write_sample(conn: &mut Connection, s: &SystemSample, live: &[LiveApp]) -
     tx.execute("DELETE FROM live_apps", [])?;
     {
         let mut stmt = tx.prepare(
-            "INSERT INTO live_apps(app, cpu, mem, io_rate, procs, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO live_apps(app, cpu, mem, io_rate, procs, ts, titles) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
         for a in live {
-            stmt.execute(params![a.app, a.cpu, a.mem as i64, a.io_rate, a.procs, s.ts])?;
+            stmt.execute(params![a.app, a.cpu, a.mem as i64, a.io_rate, a.procs, s.ts, a.titles])?;
         }
     }
     tx.execute(
@@ -253,6 +273,11 @@ pub fn upsert_app(conn: &Connection, app: &str, exe: Option<&str>, desc: Option<
             last_seen = excluded.last_seen",
         params![app, exe, desc, ts],
     )?;
+    Ok(())
+}
+
+pub fn set_window_title(conn: &Connection, app: &str, title: &str) -> Result<()> {
+    conn.execute("UPDATE apps SET window_title = ?2 WHERE app = ?1", params![app, title])?;
     Ok(())
 }
 
@@ -371,12 +396,14 @@ pub struct LiveRow {
     pub io_rate: f64,
     pub procs: i64,
     pub exe_path: Option<String>,
+    /// Taskbar window titles right now, joined with " | ".
+    pub titles: Option<String>,
 }
 
 pub fn live_apps(conn: &Connection) -> Result<Vec<LiveRow>> {
     let mut stmt = conn.prepare(
-        "SELECT l.app, a.description, l.cpu, l.mem, l.io_rate, l.procs, a.exe_path
-         FROM live_apps l LEFT JOIN apps a ON a.app = l.app
+        "SELECT l.app, a.description, l.cpu, l.mem, l.io_rate, l.procs, a.exe_path, l.titles
+         FROM live_apps l LEFT JOIN app_names a ON a.app = l.app
          ORDER BY l.cpu DESC, l.mem DESC",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -388,6 +415,7 @@ pub fn live_apps(conn: &Connection) -> Result<Vec<LiveRow>> {
             io_rate: r.get(4)?,
             procs: r.get(5)?,
             exe_path: r.get(6)?,
+            titles: r.get(7)?,
         })
     })?;
     rows.collect()
@@ -414,7 +442,7 @@ pub fn app_summaries(conn: &Connection, from: i64, to: i64) -> Result<Vec<AppSum
     let mut stmt = conn.prepare(
         "SELECT m.app, a.description, AVG(m.cpu_avg), MAX(m.cpu_max), SUM(m.cpu_avg) / 100.0,
                 AVG(m.mem_avg), MAX(m.mem_max), SUM(m.io_bytes), COUNT(*), AVG(m.procs)
-         FROM app_minutes m LEFT JOIN apps a ON a.app = m.app
+         FROM app_minutes m LEFT JOIN app_names a ON a.app = m.app
          WHERE m.minute >= ?1 AND m.minute <= ?2
          GROUP BY m.app
          ORDER BY SUM(m.cpu_avg) DESC",
@@ -486,7 +514,7 @@ pub fn weekday_hour_app_cpu(conn: &Connection, app: &str, from: i64, to: i64) ->
 pub fn top_apps_in(conn: &Connection, from: i64, to: i64, n: usize) -> Result<Vec<(String, Option<String>, f64)>> {
     let mut stmt = conn.prepare(
         "SELECT m.app, a.description, SUM(m.cpu_avg) / MAX(1, (SELECT COUNT(DISTINCT minute) FROM app_minutes WHERE minute >= ?1 AND minute <= ?2))
-         FROM app_minutes m LEFT JOIN apps a ON a.app = m.app
+         FROM app_minutes m LEFT JOIN app_names a ON a.app = m.app
          WHERE m.minute >= ?1 AND m.minute <= ?2
          GROUP BY m.app ORDER BY SUM(m.cpu_avg) DESC LIMIT ?3",
     )?;
@@ -498,7 +526,7 @@ pub fn top_apps_in(conn: &Connection, from: i64, to: i64, n: usize) -> Result<Ve
 pub fn top_mem_apps_in(conn: &Connection, from: i64, to: i64, n: usize) -> Result<Vec<(String, Option<String>, f64)>> {
     let mut stmt = conn.prepare(
         "SELECT m.app, a.description, AVG(m.mem_avg)
-         FROM app_minutes m LEFT JOIN apps a ON a.app = m.app
+         FROM app_minutes m LEFT JOIN app_names a ON a.app = m.app
          WHERE m.minute >= ?1 AND m.minute <= ?2
          GROUP BY m.app ORDER BY AVG(m.mem_avg) DESC LIMIT ?3",
     )?;
@@ -660,7 +688,7 @@ pub fn sessions(conn: &Connection, limit: usize) -> Result<Vec<SessionSummary>> 
                 COALESCE(AVG(x.mem), 0), COALESCE(MAX(x.mem), 0), COALESCE(SUM(x.io_rate), 0),
                 COALESCE(MAX(x.procs), 0)
          FROM sessions s
-         LEFT JOIN apps a ON a.app = s.app
+         LEFT JOIN app_names a ON a.app = s.app
          LEFT JOIN session_samples x ON x.session_id = s.id
          GROUP BY s.id ORDER BY (s.ended IS NULL) DESC, s.started DESC LIMIT ?1",
     )?;

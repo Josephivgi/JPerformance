@@ -1,7 +1,7 @@
 //! Background collector. Runs as `JPerformance.exe --collector`, samples the whole
 //! system every few seconds and rolls per-app usage up into one row per minute.
 
-use crate::{db, describe, paths};
+use crate::{db, describe, paths, procs};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
@@ -106,6 +106,8 @@ pub fn run() -> Result<(), String> {
     std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL.max(Duration::from_secs(1)));
 
     let mut described: HashSet<String> = HashSet::new();
+    // Last window title saved per app, so the apps table is only written on change.
+    let mut saved_titles: HashMap<String, String> = HashMap::new();
     let mut minute_acc: HashMap<String, Acc> = HashMap::new();
     let mut minute_samples: u32 = 0;
     let mut current_minute: Option<i64> = None;
@@ -178,6 +180,28 @@ pub fn run() -> Result<(), String> {
             app_count: apps.len() as i64,
         };
 
+        // Taskbar window titles per app.
+        let mut titles: HashMap<String, Vec<String>> = HashMap::new();
+        for (pid, list) in procs::window_titles() {
+            if let Some(p) = sys.process(sysinfo::Pid::from_u32(pid)) {
+                let entry = titles.entry(p.name().to_string_lossy().to_string()).or_default();
+                for t in list {
+                    if !entry.contains(&t) {
+                        entry.push(t);
+                    }
+                }
+            }
+        }
+        for (app, list) in &titles {
+            let first = &list[0];
+            if saved_titles.get(app) != Some(first) {
+                if let Err(e) = db::set_window_title(&conn, app, first) {
+                    log(&format!("set_window_title failed: {e}"));
+                }
+                saved_titles.insert(app.clone(), first.clone());
+            }
+        }
+
         // Every running app, for the live views and the Running apps page.
         let live: Vec<db::LiveApp> = apps
             .iter()
@@ -187,6 +211,7 @@ pub fn run() -> Result<(), String> {
                 mem: n.mem,
                 io_rate: n.io as f64 * 1000.0 / elapsed_ms as f64,
                 procs: n.procs,
+                titles: titles.get(name).map(|t| t.join(" | ").chars().take(400).collect()),
             })
             .collect();
 

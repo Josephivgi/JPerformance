@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use windows_sys::Win32::Foundation::{HWND, LPARAM};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GW_OWNER, GetWindow, GetWindowThreadProcessId, IsWindowVisible, PostMessageW, WM_CLOSE,
+    EnumWindows, GW_OWNER, GetWindow, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
+    PostMessageW, WM_CLOSE,
 };
 
 /// Processes Windows needs, or that would break the desktop if ended.
@@ -44,6 +45,29 @@ fn visible_windows() -> HashMap<u32, Vec<HWND>> {
     let mut out: HashMap<u32, Vec<HWND>> = HashMap::new();
     unsafe {
         EnumWindows(Some(cb), &mut out as *mut _ as LPARAM);
+    }
+    out
+}
+
+/// Titles of visible top-level windows (what the taskbar shows), by process id.
+pub fn window_titles() -> HashMap<u32, Vec<String>> {
+    let mut out: HashMap<u32, Vec<String>> = HashMap::new();
+    for (pid, hwnds) in visible_windows() {
+        for hwnd in hwnds {
+            let title = unsafe {
+                let len = GetWindowTextLengthW(hwnd);
+                if len <= 0 {
+                    continue;
+                }
+                let mut buf = vec![0u16; len as usize + 1];
+                let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+                String::from_utf16_lossy(&buf[..n.max(0) as usize])
+            };
+            let title = title.trim().to_string();
+            if !title.is_empty() {
+                out.entry(pid).or_default().push(title);
+            }
+        }
     }
     out
 }

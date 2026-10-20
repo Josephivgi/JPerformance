@@ -400,6 +400,16 @@ impl App {
     }
 }
 
+/// "Window: ..." line showing taskbar titles, unless it would only repeat the name.
+fn window_line(ui: &mut Ui, t: &Tokens, titles: Option<&str>, name: &str) {
+    if let Some(titles) = titles.filter(|s| !s.is_empty() && *s != name) {
+        let short: String = titles.chars().take(90).collect();
+        let more = if short.len() < titles.len() { "..." } else { "" };
+        ui.label(RichText::new(format!("Window: {short}{more}")).small().color(t.muted))
+            .on_hover_text(titles.replace(" | ", "\n"));
+    }
+}
+
 /// One app line in the moment panel. Returns true when clicked.
 fn moment_row(ui: &mut Ui, t: &Tokens, app: &str, desc: Option<&str>, value: &str, frac: f64) -> bool {
     let resp = ui
@@ -1055,7 +1065,7 @@ impl App {
                 ui.selectable_value(&mut self.track_minutes, Some(30), "30 minutes");
                 ui.selectable_value(&mut self.track_minutes, None, "Until I stop it");
             });
-            ui.add(egui::TextEdit::singleline(&mut self.track_filter).hint_text("Search running apps").desired_width(260.0));
+            ui.add(egui::TextEdit::singleline(&mut self.track_filter).hint_text("Search by name or window title").desired_width(260.0));
             ui.add_space(4.0);
             let filter = self.track_filter.to_lowercase();
             let mut rows: Vec<&db::LiveRow> = self
@@ -1065,6 +1075,7 @@ impl App {
                     filter.is_empty()
                         || r.app.to_lowercase().contains(&filter)
                         || r.description.as_deref().unwrap_or("").to_lowercase().contains(&filter)
+                        || r.titles.as_deref().unwrap_or("").to_lowercase().contains(&filter)
                 })
                 .collect();
             rows.sort_by(|a, b| b.mem.cmp(&a.mem));
@@ -1075,7 +1086,11 @@ impl App {
             egui::ScrollArea::vertical().id_salt("track_pick").max_height(260.0).show(ui, |ui| {
                 egui::Grid::new("track_pick_grid").num_columns(4).striped(true).spacing(vec2(18.0, 6.0)).show(ui, |ui| {
                     for r in rows {
-                        ui.label(RichText::new(describe::display_name(&r.app, r.description.as_deref())).strong());
+                        ui.vertical(|ui| {
+                            let name = describe::display_name(&r.app, r.description.as_deref());
+                            ui.label(RichText::new(&name).strong());
+                            window_line(ui, t, r.titles.as_deref(), &name);
+                        });
                         ui.label(fmt::bytes(r.mem as f64));
                         ui.label(fmt::pct(r.cpu));
                         if recording.contains(&r.app) {
@@ -1488,7 +1503,7 @@ impl App {
             ui.add_space(6.0);
         }
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.run_filter).hint_text("Search apps").desired_width(220.0));
+            ui.add(egui::TextEdit::singleline(&mut self.run_filter).hint_text("Search by name or window title").desired_width(260.0));
             ui.add_space(12.0);
             ui.label(RichText::new("Sort by").color(t.text_2));
             ui.selectable_value(&mut self.run_sort, RunSort::Memory, "Memory");
@@ -1505,6 +1520,7 @@ impl App {
                 filter.is_empty()
                     || r.app.to_lowercase().contains(&filter)
                     || r.description.as_deref().unwrap_or("").to_lowercase().contains(&filter)
+                    || r.titles.as_deref().unwrap_or("").to_lowercase().contains(&filter)
             })
             .cloned()
             .collect();
@@ -1536,8 +1552,10 @@ impl App {
                 for r in &rows {
                     ui.vertical(|ui| {
                         ui.set_max_width(460.0);
-                        ui.label(RichText::new(describe::display_name(&r.app, r.description.as_deref())).strong());
+                        let name = describe::display_name(&r.app, r.description.as_deref());
+                        ui.label(RichText::new(&name).strong());
                         ui.label(RichText::new(describe::explain(&r.app, r.description.as_deref())).small().color(t.text_2));
+                        window_line(ui, t, r.titles.as_deref(), &name);
                     });
                     ui.label(r.procs.to_string());
                     ui.label(fmt::pct(r.cpu));
