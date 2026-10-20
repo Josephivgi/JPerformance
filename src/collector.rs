@@ -90,6 +90,7 @@ pub fn run() -> Result<(), String> {
     let started = chrono::Utc::now().timestamp();
     db::mark_collector_started(&conn, std::process::id(), started).map_err(|e| e.to_string())?;
     log(&format!("collector started, pid {}", std::process::id()));
+    crate::recorder::spawn();
 
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
     let mut sys = System::new();

@@ -8,6 +8,7 @@ mod fmt;
 mod insights;
 mod paths;
 mod procs;
+mod recorder;
 mod theme;
 mod ui;
 

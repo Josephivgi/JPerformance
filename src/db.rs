@@ -46,6 +46,23 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS sessions (
+    id         INTEGER PRIMARY KEY,
+    app        TEXT    NOT NULL,
+    started    INTEGER NOT NULL,
+    ended      INTEGER,
+    end_reason TEXT,
+    planned_end INTEGER
+);
+CREATE TABLE IF NOT EXISTS session_samples (
+    session_id INTEGER NOT NULL,
+    ts         INTEGER NOT NULL,
+    cpu        REAL    NOT NULL,
+    mem        INTEGER NOT NULL,
+    io_rate    REAL    NOT NULL,
+    procs      INTEGER NOT NULL,
+    PRIMARY KEY (session_id, ts)
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS collector_status (
     id        INTEGER PRIMARY KEY CHECK (id = 1),
     pid       INTEGER NOT NULL,
@@ -81,6 +98,12 @@ fn migrate(conn: &Connection) -> Result<()> {
                 app TEXT PRIMARY KEY, cpu REAL NOT NULL, mem INTEGER NOT NULL, io_rate REAL NOT NULL,
                 procs INTEGER NOT NULL, ts INTEGER NOT NULL, last_active INTEGER NOT NULL DEFAULT 0);",
         )?;
+    }
+    let has_planned = conn
+        .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'planned_end'")?
+        .exists([])?;
+    if !has_planned {
+        conn.execute_batch("ALTER TABLE sessions ADD COLUMN planned_end INTEGER")?;
     }
     for col in ["proc_count", "app_count"] {
         if !cols.iter().any(|c| c == col) {
@@ -418,19 +441,45 @@ pub struct AppPoint {
     pub ts: i64,
     pub cpu: f64,
     pub mem: f64,
+    /// bytes per second
+    pub io_rate: f64,
+    pub procs: f64,
 }
 
 pub fn app_series(conn: &Connection, app: &str, from: i64, to: i64, bucket: i64) -> Result<Vec<AppPoint>> {
     let bucket = bucket.max(60);
     let mut stmt = conn.prepare(
-        "SELECT (minute / ?4) * ?4 AS b, AVG(cpu_avg), AVG(mem_avg)
+        "SELECT (minute / ?4) * ?4 AS b, AVG(cpu_avg), AVG(mem_avg),
+                SUM(io_bytes) / (COUNT(*) * 60.0), AVG(procs)
          FROM app_minutes WHERE app = ?1 AND minute >= ?2 AND minute <= ?3
          GROUP BY b ORDER BY b",
     )?;
     let rows = stmt.query_map(params![app, from, to, bucket], |r| {
-        Ok(AppPoint { ts: r.get(0)?, cpu: r.get(1)?, mem: r.get(2)? })
+        Ok(AppPoint { ts: r.get(0)?, cpu: r.get(1)?, mem: r.get(2)?, io_rate: r.get(3)?, procs: r.get(4)? })
     })?;
     rows.collect()
+}
+
+/// Average CPU of one app by (weekday 0 = Sunday, local hour), counting minutes it was running.
+pub fn weekday_hour_app_cpu(conn: &Connection, app: &str, from: i64, to: i64) -> Result<[[Option<f64>; 24]; 7]> {
+    let mut grid = [[None; 24]; 7];
+    let mut stmt = conn.prepare(
+        "SELECT CAST(strftime('%w', minute, 'unixepoch', 'localtime') AS INTEGER) AS d,
+                CAST(strftime('%H', minute, 'unixepoch', 'localtime') AS INTEGER) AS h,
+                AVG(cpu_avg)
+         FROM app_minutes WHERE app = ?1 AND minute >= ?2 AND minute <= ?3
+         GROUP BY d, h",
+    )?;
+    let rows = stmt.query_map(params![app, from, to], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, f64>(2)?))
+    })?;
+    for row in rows {
+        let (d, h, v) = row?;
+        if (0..7).contains(&d) && (0..24).contains(&h) {
+            grid[d as usize][h as usize] = Some(v);
+        }
+    }
+    Ok(grid)
 }
 
 /// Top apps by CPU between `from` and `to` (inclusive).
@@ -524,4 +573,126 @@ pub fn db_size_bytes(path: &Path) -> u64 {
         total += std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
     }
     total
+}
+
+// ---------- app recordings ("Track an app") ----------
+
+/// Starts recording `app`. With `minutes`, the recording stops by itself after that long.
+pub fn start_session(conn: &Connection, app: &str, minutes: Option<i64>) -> Result<i64> {
+    let now = chrono::Utc::now().timestamp();
+    conn.execute(
+        "INSERT INTO sessions(app, started, planned_end) VALUES (?1, ?2, ?3)",
+        params![app, now, minutes.map(|m| now + m * 60)],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn end_session(conn: &Connection, id: i64, reason: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET ended = ?2, end_reason = ?3 WHERE id = ?1 AND ended IS NULL",
+        params![id, chrono::Utc::now().timestamp(), reason],
+    )?;
+    Ok(())
+}
+
+pub fn delete_session(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute_batch("BEGIN")?;
+    let r = (|| {
+        conn.execute("DELETE FROM session_samples WHERE session_id = ?1", [id])?;
+        conn.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
+        Ok(())
+    })();
+    conn.execute_batch(if r.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
+    r
+}
+
+/// (id, app, planned end) of recordings still running.
+pub fn active_sessions(conn: &Connection) -> Result<Vec<(i64, String, Option<i64>)>> {
+    let mut stmt = conn.prepare("SELECT id, app, planned_end FROM sessions WHERE ended IS NULL")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    rows.collect()
+}
+
+pub struct SessionSample {
+    pub ts: i64,
+    pub cpu: f64,
+    pub mem: u64,
+    pub io_rate: f64,
+    pub procs: i64,
+}
+
+pub fn write_session_samples(conn: &mut Connection, rows: &[(i64, SessionSample)]) -> Result<()> {
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR REPLACE INTO session_samples(session_id, ts, cpu, mem, io_rate, procs) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for (id, s) in rows {
+            stmt.execute(params![id, s.ts, s.cpu, s.mem as i64, s.io_rate, s.procs])?;
+        }
+    }
+    tx.commit()
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionSummary {
+    pub id: i64,
+    pub app: String,
+    pub description: Option<String>,
+    pub started: i64,
+    pub ended: Option<i64>,
+    pub end_reason: Option<String>,
+    pub planned_end: Option<i64>,
+    pub samples: i64,
+    pub cpu_avg: f64,
+    pub cpu_peak: f64,
+    pub mem_avg: f64,
+    pub mem_peak: u64,
+    /// bytes read and written during the recording
+    pub io_total: f64,
+    pub procs_peak: i64,
+}
+
+pub fn sessions(conn: &Connection, limit: usize) -> Result<Vec<SessionSummary>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.id, s.app, a.description, s.started, s.ended, s.end_reason, s.planned_end,
+                COUNT(x.ts), COALESCE(AVG(x.cpu), 0), COALESCE(MAX(x.cpu), 0),
+                COALESCE(AVG(x.mem), 0), COALESCE(MAX(x.mem), 0), COALESCE(SUM(x.io_rate), 0),
+                COALESCE(MAX(x.procs), 0)
+         FROM sessions s
+         LEFT JOIN apps a ON a.app = s.app
+         LEFT JOIN session_samples x ON x.session_id = s.id
+         GROUP BY s.id ORDER BY (s.ended IS NULL) DESC, s.started DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit as i64], |r| {
+        Ok(SessionSummary {
+            id: r.get(0)?,
+            app: r.get(1)?,
+            description: r.get(2)?,
+            started: r.get(3)?,
+            ended: r.get(4)?,
+            end_reason: r.get(5)?,
+            planned_end: r.get(6)?,
+            samples: r.get(7)?,
+            cpu_avg: r.get(8)?,
+            cpu_peak: r.get(9)?,
+            mem_avg: r.get(10)?,
+            mem_peak: r.get::<_, i64>(11)? as u64,
+            io_total: r.get(12)?,
+            procs_peak: r.get(13)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Samples of one recording, averaged into `bucket`-second buckets.
+pub fn session_series(conn: &Connection, id: i64, bucket: i64) -> Result<Vec<AppPoint>> {
+    let mut stmt = conn.prepare(
+        "SELECT (ts / ?2) * ?2 AS b, AVG(cpu), AVG(mem), AVG(io_rate), AVG(procs)
+         FROM session_samples WHERE session_id = ?1 GROUP BY b ORDER BY b",
+    )?;
+    let rows = stmt.query_map(params![id, bucket.max(1)], |r| {
+        Ok(AppPoint { ts: r.get(0)?, cpu: r.get(1)?, mem: r.get(2)?, io_rate: r.get(3)?, procs: r.get(4)? })
+    })?;
+    rows.collect()
 }

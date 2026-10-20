@@ -26,6 +26,7 @@ enum Page {
     Apps,
     Insights,
     Running,
+    Track,
     Settings,
 }
 
@@ -135,6 +136,16 @@ struct App {
     /// When each app was last asked to stop.
     stops: HashMap<String, Instant>,
     confirm_force: Option<String>,
+    hist_app: Option<String>,
+    hist_series: Vec<db::AppPoint>,
+    track_filter: String,
+    /// Recording length in minutes; None records until stopped.
+    track_minutes: Option<i64>,
+    track_notice: Option<(String, bool)>,
+    sessions: Vec<db::SessionSummary>,
+    view_session: Option<i64>,
+    session_points: Vec<db::AppPoint>,
+    confirm_delete_session: Option<i64>,
 
     tracking: bool,
     autostart: bool,
@@ -186,6 +197,15 @@ impl App {
             run_notice: None,
             stops: HashMap::new(),
             confirm_force: None,
+            hist_app: None,
+            hist_series: Vec::new(),
+            track_filter: String::new(),
+            track_minutes: Some(10),
+            track_notice: None,
+            sessions: Vec::new(),
+            view_session: None,
+            session_points: Vec::new(),
+            confirm_delete_session: None,
             tracking,
             autostart: autostart::is_enabled(),
             confirm_clear: false,
@@ -204,6 +224,17 @@ impl App {
                 self.live = db::live_apps(&self.conn)?;
                 self.status = db::collector_status(&self.conn)?;
                 self.tips.map.clear();
+                self.sessions = db::sessions(&self.conn, 100)?;
+                if self.view_session.is_none() {
+                    self.view_session = self.sessions.iter().find(|s| s.ended.is_none()).map(|s| s.id);
+                }
+                self.session_points = match self.view_session.and_then(|id| self.sessions.iter().find(|s| s.id == id)) {
+                    Some(s) => {
+                        let end = s.ended.unwrap_or(now);
+                        db::session_series(&self.conn, s.id, ((end - s.started) / 1500).max(1))?
+                    }
+                    None => Vec::new(),
+                };
                 Ok(())
             })();
             self.collector_running = collector::is_running();
@@ -215,7 +246,16 @@ impl App {
             let from = now - self.range.secs();
             let r: db::Result<()> = (|| {
                 self.history = db::system_series(&self.conn, from, now, self.range.bucket())?;
-                self.heat = db::weekday_hour_cpu(&self.conn, from, now)?;
+                match &self.hist_app {
+                    Some(app) => {
+                        self.hist_series = db::app_series(&self.conn, app, from, now, self.range.bucket())?;
+                        self.heat = db::weekday_hour_app_cpu(&self.conn, app, from, now)?;
+                    }
+                    None => {
+                        self.hist_series.clear();
+                        self.heat = db::weekday_hour_cpu(&self.conn, from, now)?;
+                    }
+                }
                 self.apps = db::app_summaries(&self.conn, from, now)?;
                 self.insights = insights::compute(&self.conn, from, now)?;
                 self.app_series = match &self.selected_app {
@@ -419,6 +459,7 @@ impl eframe::App for App {
                     Page::Apps => self.page_apps(ui, &t),
                     Page::Insights => self.page_insights(ui, &t),
                     Page::Running => self.page_running(ui, &t),
+                    Page::Track => self.page_track(ui, &t),
                     Page::Settings => self.page_settings(ui, &t),
                 });
             });
@@ -428,6 +469,9 @@ impl eframe::App for App {
         }
         if self.confirm_force.is_some() {
             self.force_dialog(ui, &t);
+        }
+        if self.confirm_delete_session.is_some() {
+            self.delete_session_dialog(ui, &t);
         }
     }
 }
@@ -705,6 +749,7 @@ impl App {
         for (page, label) in [
             (Page::Now, "Right now"),
             (Page::Running, "Running apps"),
+            (Page::Track, "Track an app"),
             (Page::History, "History"),
             (Page::Apps, "Apps"),
             (Page::Insights, "Insights"),
@@ -854,43 +899,377 @@ impl App {
     }
 
     fn page_history(&mut self, ui: &mut Ui, t: &Tokens) {
-        heading(ui, t, "History", "How hard your PC worked over time. Hover a chart to see which apps were behind it, click to keep that moment open.");
+        heading(
+            ui,
+            t,
+            "History",
+            "How hard your PC worked over time. Hover a chart to see which apps were behind it, click to keep that moment open.",
+        );
         self.range_picker(ui);
+
+        // Whole PC or one app.
+        let shown = match &self.hist_app {
+            Some(app) => {
+                let desc = self.apps.iter().find(|a| &a.app == app).and_then(|a| a.description.clone());
+                describe::display_name(app, desc.as_deref())
+            }
+            None => "All apps (whole PC)".to_string(),
+        };
+        let mut pick: Option<Option<String>> = None;
+        ui.horizontal(|ui| {
+            ui.label("Show");
+            egui::ComboBox::from_id_salt("hist_app").selected_text(shown).width(280.0).height(420.0).show_ui(ui, |ui| {
+                if ui.selectable_label(self.hist_app.is_none(), "All apps (whole PC)").clicked() {
+                    pick = Some(None);
+                }
+                for a in &self.apps {
+                    let name = describe::display_name(&a.app, a.description.as_deref());
+                    let selected = self.hist_app.as_deref() == Some(a.app.as_str());
+                    if ui.selectable_label(selected, name).clicked() {
+                        pick = Some(Some(a.app.clone()));
+                    }
+                }
+            });
+            if self.hist_app.is_some() && ui.button("Show whole PC").clicked() {
+                pick = Some(None);
+            }
+        });
+        if let Some(p) = pick {
+            self.hist_app = p;
+            self.range_dirty = true;
+            self.moment = None;
+        }
+        ui.add_space(theme::GAP);
+
         let now = chrono::Utc::now().timestamp();
         let x_range = Some((now - self.range.secs(), now));
-        let gap = (3 * self.range.bucket()).max(60);
-        let series = |f: fn(&db::SysPoint) -> f64| self.history.iter().map(|p| (p.ts, f(p))).collect::<Vec<_>>();
-        let procs: Vec<(i64, f64)> = self.history.iter().filter(|p| p.procs > 0.0).map(|p| (p.ts, p.procs)).collect();
-        let charts: [(&str, &str, fn(f64) -> String, Option<f64>, Tip, Vec<(i64, f64)>); 5] = [
-            ("h_cpu", "CPU", pct_fmt, Some(100.0), Tip::Cpu, series(|p| p.cpu)),
-            ("h_mem", "Memory", pct_fmt, Some(100.0), Tip::Mem, series(|p| p.mem_pct)),
-            ("h_io", "Disk and file I/O", rate_fmt, None, Tip::Io, series(|p| p.io_rate)),
-            ("h_net", "Network", rate_fmt, None, Tip::Net, series(|p| p.net_rate)),
-            ("h_procs", "Processes running", count_fmt, None, Tip::Procs, procs),
-        ];
         let marker = self.moment.as_ref().map(Moment::center);
         let mut clicked = None;
-        let bucket = self.range.bucket();
-        for (id, title, value_fmt, y_max, tip, pts) in charts {
-            let spec = ChartSpec { id, title, value_fmt, y_max, height: 150.0, gap, x_range, marker, tip, bucket };
-            let c = time_chart(ui, t, spec, &pts, &mut self.tips, &self.conn);
-            clicked = clicked.or(c);
-            ui.add_space(theme::GAP / 2.0);
-        }
-        if let Some(ts) = clicked {
-            self.select_at(ts, self.range.bucket());
-        }
 
-        section(ui, t, "Busy times by day and hour");
-        ui.label(
-            RichText::new("Average CPU for each hour of each weekday in this range. Darker means busier. Click a square to see the most recent time it covers.")
+        if let Some(app) = self.hist_app.clone() {
+            let bucket = self.range.bucket().max(60);
+            let gap = 3 * bucket + 60;
+            let series = |f: fn(&db::AppPoint) -> f64| self.hist_series.iter().map(|p| (p.ts, f(p))).collect::<Vec<_>>();
+            let charts: [(&str, &str, fn(f64) -> String, Vec<(i64, f64)>); 4] = [
+                ("ha_cpu", "CPU (share of the whole PC)", pct_fmt, series(|p| p.cpu)),
+                ("ha_mem", "Memory", bytes_fmt, series(|p| p.mem)),
+                ("ha_io", "Disk and file I/O", rate_fmt, series(|p| p.io_rate)),
+                ("ha_procs", "Processes", count_fmt, series(|p| p.procs)),
+            ];
+            for (id, title, value_fmt, pts) in charts {
+                let spec = ChartSpec { id, title, value_fmt, y_max: None, height: 150.0, gap, x_range, marker, tip: Tip::None, bucket };
+                clicked = clicked.or(time_chart(ui, t, spec, &pts, &mut self.tips, &self.conn));
+                ui.add_space(theme::GAP / 2.0);
+            }
+            ui.label(RichText::new("Network use is not shown for single apps because Windows does not report it per app. Gaps mean the app was not running or tracking was off.").small().color(t.muted));
+            if let Some(ts) = clicked {
+                self.select_at(ts, bucket);
+            }
+            let desc = self.apps.iter().find(|a| a.app == app).and_then(|a| a.description.clone());
+            section(ui, t, "Busy times by day and hour");
+            ui.label(
+                RichText::new(format!(
+                    "Average CPU of {} for each hour of each weekday in this range, while it was running.",
+                    describe::display_name(&app, desc.as_deref())
+                ))
                 .color(t.text_2),
-        );
+            );
+        } else {
+            let gap = (3 * self.range.bucket()).max(60);
+            let series = |f: fn(&db::SysPoint) -> f64| self.history.iter().map(|p| (p.ts, f(p))).collect::<Vec<_>>();
+            let procs: Vec<(i64, f64)> = self.history.iter().filter(|p| p.procs > 0.0).map(|p| (p.ts, p.procs)).collect();
+            let charts: [(&str, &str, fn(f64) -> String, Option<f64>, Tip, Vec<(i64, f64)>); 5] = [
+                ("h_cpu", "CPU", pct_fmt, Some(100.0), Tip::Cpu, series(|p| p.cpu)),
+                ("h_mem", "Memory", pct_fmt, Some(100.0), Tip::Mem, series(|p| p.mem_pct)),
+                ("h_io", "Disk and file I/O", rate_fmt, None, Tip::Io, series(|p| p.io_rate)),
+                ("h_net", "Network", rate_fmt, None, Tip::Net, series(|p| p.net_rate)),
+                ("h_procs", "Processes running", count_fmt, None, Tip::Procs, procs),
+            ];
+            let bucket = self.range.bucket();
+            for (id, title, value_fmt, y_max, tip, pts) in charts {
+                let spec = ChartSpec { id, title, value_fmt, y_max, height: 150.0, gap, x_range, marker, tip, bucket };
+                clicked = clicked.or(time_chart(ui, t, spec, &pts, &mut self.tips, &self.conn));
+                ui.add_space(theme::GAP / 2.0);
+            }
+            if let Some(ts) = clicked {
+                self.select_at(ts, self.range.bucket());
+            }
+            section(ui, t, "Busy times by day and hour");
+            ui.label(
+                RichText::new("Average CPU for each hour of each weekday in this range. Darker means busier. Click a square to see the most recent time it covers.")
+                    .color(t.text_2),
+            );
+        }
         ui.add_space(6.0);
         if let Some((day, hour)) = theme::card(t).show(ui, |ui| heatmap(ui, t, &self.heat)).inner {
             if let Some(from) = latest_weekday_hour(day, hour, self.range.secs()) {
                 self.select_window(from, from + 3599);
             }
+        }
+    }
+
+    fn start_tracking(&mut self, app: &str) {
+        if !self.tracking {
+            self.track_notice = Some(("Background tracking is off. Turn it on in Settings to record an app.".into(), true));
+            self.page = Page::Track;
+            return;
+        }
+        if !self.collector_running {
+            let _ = collector::spawn_detached();
+        }
+        match db::start_session(&self.conn, app, self.track_minutes) {
+            Ok(id) => {
+                self.view_session = Some(id);
+                self.track_notice = None;
+                self.last_live = None;
+            }
+            Err(e) => self.track_notice = Some((format!("Could not start the recording: {e}"), true)),
+        }
+        self.page = Page::Track;
+    }
+
+    fn page_track(&mut self, ui: &mut Ui, t: &Tokens) {
+        heading(
+            ui,
+            t,
+            "Track an app",
+            "Pick a running app and press Start. JPerformance records it every second until you press Stop or the app closes. Recording keeps going if you close this window.",
+        );
+        if let Some((msg, is_err)) = &self.track_notice {
+            ui.horizontal(|ui| {
+                status_dot(ui, if *is_err { t.critical } else { t.good });
+                ui.label(RichText::new(msg).color(t.text_2));
+            });
+            ui.add_space(6.0);
+        }
+
+        // Pick an app.
+        let recording: Vec<String> = self.sessions.iter().filter(|s| s.ended.is_none()).map(|s| s.app.clone()).collect();
+        let mut start: Option<String> = None;
+        theme::card(t).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(RichText::new("Start a recording").strong());
+            ui.horizontal(|ui| {
+                ui.label("Record for");
+                ui.selectable_value(&mut self.track_minutes, Some(10), "10 minutes");
+                ui.selectable_value(&mut self.track_minutes, Some(30), "30 minutes");
+                ui.selectable_value(&mut self.track_minutes, None, "Until I stop it");
+            });
+            ui.add(egui::TextEdit::singleline(&mut self.track_filter).hint_text("Search running apps").desired_width(260.0));
+            ui.add_space(4.0);
+            let filter = self.track_filter.to_lowercase();
+            let mut rows: Vec<&db::LiveRow> = self
+                .live
+                .iter()
+                .filter(|r| {
+                    filter.is_empty()
+                        || r.app.to_lowercase().contains(&filter)
+                        || r.description.as_deref().unwrap_or("").to_lowercase().contains(&filter)
+                })
+                .collect();
+            rows.sort_by(|a, b| b.mem.cmp(&a.mem));
+            if rows.is_empty() {
+                ui.label(RichText::new("No running apps match. The list fills in once background tracking reports.").color(t.muted));
+                return;
+            }
+            egui::ScrollArea::vertical().id_salt("track_pick").max_height(260.0).show(ui, |ui| {
+                egui::Grid::new("track_pick_grid").num_columns(4).striped(true).spacing(vec2(18.0, 6.0)).show(ui, |ui| {
+                    for r in rows {
+                        ui.label(RichText::new(describe::display_name(&r.app, r.description.as_deref())).strong());
+                        ui.label(fmt::bytes(r.mem as f64));
+                        ui.label(fmt::pct(r.cpu));
+                        if recording.contains(&r.app) {
+                            ui.label(RichText::new("Recording").color(t.text_2));
+                        } else if ui.button("Start").clicked() {
+                            start = Some(r.app.clone());
+                        }
+                        ui.end_row();
+                    }
+                });
+            });
+        });
+        if let Some(app) = start {
+            self.start_tracking(&app);
+        }
+
+        // The recording being viewed.
+        let viewed = self.view_session.and_then(|id| self.sessions.iter().find(|s| s.id == id).cloned());
+        if let Some(s) = viewed {
+            ui.add_space(theme::GAP);
+            let now = chrono::Utc::now().timestamp();
+            let end = s.ended.unwrap_or(now);
+            let name = describe::display_name(&s.app, s.description.as_deref());
+            let mut stop = false;
+            let mut delete = false;
+            let mut close = false;
+            theme::card(t).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&name).size(17.0).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if s.ended.is_none() {
+                            if ui.button(RichText::new("Stop").strong()).clicked() {
+                                stop = true;
+                            }
+                        } else {
+                            if ui.button("Close").clicked() {
+                                close = true;
+                            }
+                            if ui.button(RichText::new("Delete").color(t.critical)).clicked() {
+                                delete = true;
+                            }
+                        }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    if s.ended.is_none() {
+                        status_dot(ui, t.good);
+                        let left = match s.planned_end {
+                            Some(p) => format!(", {} left", fmt::duration(p - now)),
+                            None => ", until you stop it".to_string(),
+                        };
+                        ui.label(RichText::new(format!("Recording for {}{left}", fmt::duration(end - s.started))).color(t.text_2));
+                    } else {
+                        let why = match s.end_reason.as_deref() {
+                            Some("app closed") => ", ended when the app closed",
+                            Some("time up") => ", stopped at the time you chose",
+                            _ => "",
+                        };
+                        ui.label(
+                            RichText::new(format!("Recorded {} for {}{why}", fmt::day_time(s.started), fmt::duration(end - s.started)))
+                                .color(t.text_2),
+                        );
+                    }
+                });
+                ui.add_space(6.0);
+                if s.samples == 0 {
+                    ui.label(RichText::new("Waiting for the first sample.").color(t.muted));
+                    return;
+                }
+                egui::Grid::new("session_stats").num_columns(4).spacing(vec2(28.0, 4.0)).show(ui, |ui| {
+                    for h in ["CPU average / peak", "Memory average / peak", "Disk and file I/O", "Most processes"] {
+                        ui.label(RichText::new(h).small().color(t.muted));
+                    }
+                    ui.end_row();
+                    ui.label(RichText::new(format!("{} / {}", fmt::pct(s.cpu_avg), fmt::pct(s.cpu_peak))).strong());
+                    ui.label(RichText::new(format!("{} / {}", fmt::bytes(s.mem_avg), fmt::bytes(s.mem_peak as f64))).strong());
+                    ui.label(RichText::new(fmt::bytes(s.io_total)).strong());
+                    ui.label(RichText::new(s.procs_peak.to_string()).strong());
+                    ui.end_row();
+                });
+            });
+            if s.samples > 0 {
+                let bucket = ((end - s.started) / 1500).max(1);
+                let gap = 5 * bucket + 3;
+                // A timed recording shows its full planned length while it runs.
+                let x_end = if s.ended.is_none() { s.planned_end.unwrap_or(end).max(end) } else { end };
+                let x_range = Some((s.started, x_end));
+                let series = |f: fn(&db::AppPoint) -> f64| self.session_points.iter().map(|p| (p.ts, f(p))).collect::<Vec<_>>();
+                let (cpu, mem, io, procs) = (series(|p| p.cpu), series(|p| p.mem), series(|p| p.io_rate), series(|p| p.procs));
+                ui.add_space(theme::GAP / 2.0);
+                let spec = |id, title, value_fmt| ChartSpec {
+                    id,
+                    title,
+                    value_fmt,
+                    y_max: None,
+                    height: 140.0,
+                    gap,
+                    x_range,
+                    marker: None,
+                    tip: Tip::None,
+                    bucket,
+                };
+                ui.columns(2, |cols| {
+                    time_chart(&mut cols[0], t, spec("s_cpu", "CPU (share of the whole PC)", pct_fmt as fn(f64) -> String), &cpu, &mut self.tips, &self.conn);
+                    time_chart(&mut cols[1], t, spec("s_mem", "Memory", bytes_fmt), &mem, &mut self.tips, &self.conn);
+                });
+                ui.add_space(theme::GAP / 2.0);
+                ui.columns(2, |cols| {
+                    time_chart(&mut cols[0], t, spec("s_io", "Disk and file I/O", rate_fmt), &io, &mut self.tips, &self.conn);
+                    time_chart(&mut cols[1], t, spec("s_procs", "Processes", count_fmt), &procs, &mut self.tips, &self.conn);
+                });
+            }
+            if stop {
+                if let Err(e) = db::end_session(&self.conn, s.id, "stopped") {
+                    self.track_notice = Some((format!("Could not stop the recording: {e}"), true));
+                }
+                self.last_live = None;
+            }
+            if close {
+                self.view_session = None;
+            }
+            if delete {
+                self.confirm_delete_session = Some(s.id);
+            }
+        }
+
+        // Past and current recordings.
+        section(ui, t, "Recordings");
+        let mut view: Option<i64> = None;
+        theme::card(t).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            if self.sessions.is_empty() {
+                ui.label(RichText::new("No recordings yet.").color(t.muted));
+                return;
+            }
+            let now = chrono::Utc::now().timestamp();
+            egui::Grid::new("sessions").num_columns(6).striped(true).spacing(vec2(18.0, 6.0)).show(ui, |ui| {
+                for h in ["App", "Started", "Length", "CPU average", "Memory peak", ""] {
+                    ui.label(RichText::new(h).small().color(t.muted));
+                }
+                ui.end_row();
+                for s in &self.sessions {
+                    ui.horizontal(|ui| {
+                        if s.ended.is_none() {
+                            status_dot(ui, t.good);
+                        }
+                        ui.label(RichText::new(describe::display_name(&s.app, s.description.as_deref())).strong());
+                    });
+                    ui.label(fmt::day_time(s.started));
+                    ui.label(fmt::duration(s.ended.unwrap_or(now) - s.started));
+                    ui.label(fmt::pct(s.cpu_avg));
+                    ui.label(fmt::bytes(s.mem_peak as f64));
+                    let viewing = self.view_session == Some(s.id);
+                    if ui.selectable_label(viewing, if viewing { "Viewing" } else { "View" }).clicked() {
+                        view = Some(s.id);
+                    }
+                    ui.end_row();
+                }
+            });
+        });
+        if let Some(id) = view {
+            self.view_session = Some(id);
+            self.last_live = None;
+        }
+    }
+
+    fn delete_session_dialog(&mut self, ui: &mut Ui, t: &Tokens) {
+        let Some(id) = self.confirm_delete_session else { return };
+        let resp = egui::Modal::new(egui::Id::unique("confirm_delete_session")).show(ui.ctx(), |ui| {
+            ui.set_width(360.0);
+            ui.label(RichText::new("Delete this recording?").size(16.0).strong());
+            ui.label(RichText::new("Its samples are removed for good. Other history is kept.").color(t.text_2));
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button(RichText::new("Delete recording").color(t.critical)).clicked() {
+                    match db::delete_session(&self.conn, id) {
+                        Ok(()) => {
+                            if self.view_session == Some(id) {
+                                self.view_session = None;
+                            }
+                        }
+                        Err(e) => self.track_notice = Some((format!("Could not delete the recording: {e}"), true)),
+                    }
+                    self.confirm_delete_session = None;
+                    self.last_live = None;
+                }
+                if ui.button("Cancel").clicked() {
+                    self.confirm_delete_session = None;
+                }
+            });
+        });
+        if resp.should_close() {
+            self.confirm_delete_session = None;
         }
     }
 
@@ -1137,6 +1516,7 @@ impl App {
 
         let mut stop: Option<String> = None;
         let mut force: Option<String> = None;
+        let mut track: Option<String> = None;
         theme::card(t).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             if rows.is_empty() {
@@ -1180,9 +1560,14 @@ impl App {
                                 }
                             }
                             None => {
-                                if ui.button("Stop app").clicked() {
-                                    stop = Some(r.app.clone());
-                                }
+                                ui.horizontal(|ui| {
+                                    if ui.button("Stop app").clicked() {
+                                        stop = Some(r.app.clone());
+                                    }
+                                    if ui.button("Track").on_hover_text("Record this app every second, for the length chosen on Track an app").clicked() {
+                                        track = Some(r.app.clone());
+                                    }
+                                });
                             }
                         }
                     }
@@ -1195,6 +1580,9 @@ impl App {
         }
         if let Some(app) = force {
             self.confirm_force = Some(app);
+        }
+        if let Some(app) = track {
+            self.start_tracking(&app);
         }
         // Forget stop attempts for apps that have closed.
         let running: std::collections::HashSet<&str> = self.live.iter().map(|r| r.app.as_str()).collect();
@@ -1313,7 +1701,7 @@ impl App {
         let resp = egui::Modal::new(egui::Id::unique("confirm_clear")).show(ui.ctx(), |ui| {
             ui.set_width(360.0);
             ui.label(RichText::new("Clear all recorded history?").size(16.0).strong());
-            ui.label(RichText::new("This permanently deletes every sample and app record. Settings are kept.").color(t.text_2));
+            ui.label(RichText::new("This permanently deletes every sample and app record. Settings and saved app recordings are kept.").color(t.text_2));
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if ui.button(RichText::new("Delete history").color(t.critical)).clicked() {
