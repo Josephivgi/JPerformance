@@ -107,14 +107,20 @@ fn latest() -> Result<Option<Release>, String> {
     }))
 }
 
+/// How often an open window looks for a new release.
+const CHECK_EVERY: Duration = Duration::from_secs(30 * 60);
+/// Coming back to the window checks again if the last check is this old.
+const CHECK_ON_FOCUS: Duration = Duration::from_secs(5 * 60);
+
 pub struct Updater {
     state: Arc<Mutex<State>>,
     last_check: Option<Instant>,
+    was_focused: bool,
 }
 
 impl Updater {
     pub fn new() -> Self {
-        Self { state: Arc::new(Mutex::new(State::Idle)), last_check: None }
+        Self { state: Arc::new(Mutex::new(State::Idle)), last_check: None, was_focused: true }
     }
 
     pub fn state(&self) -> State {
@@ -130,11 +136,17 @@ impl Updater {
         matches!(self.state(), State::Checking | State::Downloading(..) | State::Restarting)
     }
 
-    /// Checks at launch and then every 6 hours.
+    /// Checks at launch, every 30 minutes, and when the window is focused
+    /// again after 5 minutes, so a window left open still sees new releases.
     pub fn tick(&mut self, ctx: &eframe::egui::Context) {
-        if self.last_check.is_none_or(|t| t.elapsed() >= Duration::from_secs(6 * 3600))
-            && !matches!(self.state(), State::Available(_))
-        {
+        let focused = ctx.input(|i| i.focused);
+        let refocused = focused && !self.was_focused;
+        self.was_focused = focused;
+        let due = match self.last_check {
+            None => true,
+            Some(t) => t.elapsed() >= CHECK_EVERY || (refocused && t.elapsed() >= CHECK_ON_FOCUS),
+        };
+        if due && !matches!(self.state(), State::Available(_)) {
             self.check(ctx);
         }
     }

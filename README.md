@@ -20,7 +20,7 @@ All data stays on your PC in `%APPDATA%\JPerformance\jperformance.db` (SQLite). 
 
 Download `JPerformance.exe` from the [latest release](https://github.com/Josephivgi/JPerformance/releases/latest) and run it from a folder you can write to (Desktop, Documents, or a folder of your own, not Program Files).
 
-JPerformance checks for a new release when it opens and every 6 hours. When there is one, the bottom of the menu says so and offers **Install** and **What's new**. Nothing covers the pages and nothing is installed unless you press Install. The download is checked against the SHA-256 that GitHub publishes for the release before it replaces the app. You can also press **Check for updates** at the bottom of the menu.
+JPerformance checks for a new release when it opens, every 30 minutes, and when you come back to the window. When there is one, the bottom of the menu says so and offers **Install** and **What's new**. Nothing covers the pages and nothing is installed unless you press Install. The download is checked against the SHA-256 that GitHub publishes for the release before it replaces the app. You can also press **Check for updates** at the bottom of the menu.
 
 ## Releasing a new version
 
