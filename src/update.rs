@@ -14,8 +14,6 @@ use std::time::{Duration, Instant};
 pub const REPO: &str = "Josephivgi/JPerformance";
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 const ASSET: &str = "JPerformance.exe";
-/// Settings key holding a version the user chose to skip.
-pub const KEY_SKIPPED: &str = "update_skipped_version";
 
 #[derive(Clone)]
 pub struct Release {

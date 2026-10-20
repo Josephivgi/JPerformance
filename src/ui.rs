@@ -13,7 +13,8 @@ pub fn run() -> Result<(), String> {
         viewport: egui::ViewportBuilder::default()
             .with_title("JPerformance")
             .with_inner_size([1200.0, 800.0])
-            .with_min_inner_size([900.0, 600.0]),
+            .with_min_inner_size([900.0, 600.0])
+            .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).unwrap_or_default()),
         ..Default::default()
     };
     eframe::run_native("JPerformance", options, Box::new(|cc| Ok(Box::new(App::new(cc)?))))
@@ -152,11 +153,7 @@ struct App {
     error: Option<String>,
 
     updater: Updater,
-    /// "Later" was pressed; hide the update banner until the next launch.
-    update_later: bool,
-    /// Version the user chose to skip.
-    update_skipped: Option<String>,
-    /// The user pressed Install, so failures are shown in the banner.
+    /// The user pressed Install, so a failure is about installing, not checking.
     update_installing: bool,
     show_update_notes: bool,
 }
@@ -173,9 +170,7 @@ impl App {
         autostart::refresh_path();
         update::cleanup_after_update();
         Ok(Self {
-            update_skipped: db::get_setting(&conn, update::KEY_SKIPPED)?,
             updater: Updater::new(),
-            update_later: false,
             update_installing: false,
             show_update_notes: false,
             interval: db::setting_i64(&conn, db::KEY_INTERVAL, db::DEFAULT_INTERVAL),
@@ -459,7 +454,6 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(t.bg).inner_margin(egui::Margin::symmetric(24, 18)))
             .show(ui, |ui| {
-                self.update_banner(ui, &t);
                 if let Some(err) = &self.error {
                     ui.colored_label(t.critical, err);
                 }
@@ -488,75 +482,6 @@ impl eframe::App for App {
 // ---------- updates ----------
 
 impl App {
-    /// Offers a newer release. Nothing is installed unless the user presses Install.
-    fn update_banner(&mut self, ui: &mut Ui, t: &Tokens) {
-        let state = self.updater.state();
-        let show = match &state {
-            update::State::Available(r) => !self.update_later && self.update_skipped.as_deref() != Some(r.version.as_str()),
-            update::State::Downloading(..) | update::State::Restarting => true,
-            update::State::Failed(_) => self.update_installing,
-            _ => false,
-        };
-        if !show {
-            return;
-        }
-        theme::card(t).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            match state {
-                update::State::Available(rel) => {
-                    ui.label(RichText::new(format!("JPerformance {} is available", rel.version)).strong());
-                    ui.label(
-                        RichText::new(format!("You have {}. Background tracking pauses for a few seconds while it installs.", update::CURRENT))
-                            .color(t.text_2),
-                    );
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.button(RichText::new("Install and restart").strong()).clicked() {
-                            self.update_installing = true;
-                            self.updater.install(rel.clone(), ui.ctx());
-                        }
-                        if ui.button("What's new").clicked() {
-                            self.show_update_notes = true;
-                        }
-                        if ui.button("Later").on_hover_text("Ask again next time JPerformance opens.").clicked() {
-                            self.update_later = true;
-                        }
-                        if ui.button("Skip this version").on_hover_text("Don't ask about this version again.").clicked() {
-                            match db::set_setting(&self.conn, update::KEY_SKIPPED, &rel.version) {
-                                Ok(()) => self.update_skipped = Some(rel.version.clone()),
-                                Err(e) => self.error = Some(format!("Could not save that choice: {e}")),
-                            }
-                        }
-                    });
-                }
-                update::State::Downloading(done, total) => {
-                    ui.label(RichText::new("Downloading update").strong());
-                    let frac = if total > 0 { done as f32 / total as f32 } else { 0.0 };
-                    ui.add(egui::ProgressBar::new(frac).text(format!("{} of {}", fmt::bytes(done as f64), fmt::bytes(total as f64))));
-                }
-                update::State::Restarting => {
-                    ui.label(RichText::new("Update installed. Restarting JPerformance.").strong());
-                }
-                update::State::Failed(e) => {
-                    ui.label(RichText::new("The update was not installed").strong().color(t.critical));
-                    ui.label(RichText::new(e).color(t.text_2));
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Try again").clicked() {
-                            self.update_installing = false;
-                            self.updater.check(ui.ctx());
-                        }
-                        if ui.button("Close").clicked() {
-                            self.update_installing = false;
-                        }
-                    });
-                }
-                _ => {}
-            }
-        });
-        ui.add_space(theme::GAP);
-    }
-
     fn update_notes_dialog(&mut self, ui: &mut Ui, t: &Tokens) {
         let update::State::Available(rel) = self.updater.state() else {
             self.show_update_notes = false;
@@ -588,29 +513,57 @@ impl App {
         }
     }
 
-    /// Version line and a manual "Check for updates" at the bottom of the menu.
+    /// Update controls at the bottom of the menu. Nothing pops up over the
+    /// pages; a newer release only shows here, and installs when asked.
     fn update_status(&mut self, ui: &mut Ui, t: &Tokens) {
-        let note = match self.updater.state() {
-            update::State::Checking => Some("Checking for updates".to_string()),
-            update::State::UpToDate => Some("You have the latest version".to_string()),
-            update::State::Available(r) => Some(format!("Version {} is available", r.version)),
-            update::State::Failed(_) if !self.update_installing => Some("Could not check for updates".to_string()),
-            _ => None,
-        };
-        let available = matches!(self.updater.state(), update::State::Available(_));
-        if available {
-            if ui.small_button("Show update").clicked() {
-                self.update_later = false;
-                self.update_skipped = None;
-                let _ = db::set_setting(&self.conn, update::KEY_SKIPPED, "");
-            }
-        } else if ui.small_button("Check for updates").clicked() {
-            self.updater.check(ui.ctx());
-        }
-        if let Some(note) = note {
-            ui.label(RichText::new(note).small().color(t.muted));
-        }
+        // Laid out bottom-up, so the version line is added first.
         ui.label(RichText::new(format!("Version {}", update::CURRENT)).small().color(t.muted));
+        match self.updater.state() {
+            update::State::Available(rel) => {
+                ui.horizontal(|ui| {
+                    if ui.small_button("What's new").clicked() {
+                        self.show_update_notes = true;
+                    }
+                    if ui
+                        .small_button(RichText::new("Install").strong())
+                        .on_hover_text("Restarts JPerformance. Background tracking pauses for a few seconds.")
+                        .clicked()
+                    {
+                        self.update_installing = true;
+                        self.updater.install(rel.clone(), ui.ctx());
+                    }
+                });
+                ui.label(RichText::new(format!("Version {} is available", rel.version)).small().color(t.accent));
+            }
+            update::State::Downloading(done, total) => {
+                let frac = if total > 0 { done as f32 / total as f32 } else { 0.0 };
+                ui.add(egui::ProgressBar::new(frac).desired_height(6.0));
+                ui.label(RichText::new("Downloading update").small().color(t.muted));
+            }
+            update::State::Restarting => {
+                ui.label(RichText::new("Restarting").small().color(t.muted));
+            }
+            state => {
+                if ui.small_button("Check for updates").clicked() {
+                    self.update_installing = false;
+                    self.updater.check(ui.ctx());
+                }
+                let note = match state {
+                    update::State::Checking => Some("Checking for updates"),
+                    update::State::UpToDate => Some("You have the latest version"),
+                    update::State::Failed(_) if self.update_installing => Some("The update was not installed"),
+                    update::State::Failed(_) => Some("Could not check for updates"),
+                    _ => None,
+                };
+                if let Some(note) = note {
+                    let color = if self.update_installing { t.critical } else { t.muted };
+                    let resp = ui.label(RichText::new(note).small().color(color));
+                    if let update::State::Failed(e) = state {
+                        resp.on_hover_text(e);
+                    }
+                }
+            }
+        }
     }
 }
 

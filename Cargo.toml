@@ -1,6 +1,6 @@
 [package]
 name = "jperformance"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Track Windows app performance over time"
 
@@ -24,3 +24,6 @@ winreg = "0.56.0"
 opt-level = 3
 lto = "thin"
 strip = true
+
+[build-dependencies]
+winresource = "0.1.34"
