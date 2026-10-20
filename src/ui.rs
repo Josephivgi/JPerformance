@@ -200,7 +200,7 @@ impl App {
             hist_app: None,
             hist_series: Vec::new(),
             track_filter: String::new(),
-            track_minutes: Some(10),
+            track_minutes: None,
             track_notice: None,
             sessions: Vec::new(),
             view_session: None,
@@ -401,11 +401,10 @@ impl App {
 }
 
 /// "Window: ..." line showing taskbar titles, unless it would only repeat the name.
+/// Fills the column's width and is cut off only at its edge.
 fn window_line(ui: &mut Ui, t: &Tokens, titles: Option<&str>, name: &str) {
     if let Some(titles) = titles.filter(|s| !s.is_empty() && *s != name) {
-        let short: String = titles.chars().take(90).collect();
-        let more = if short.len() < titles.len() { "..." } else { "" };
-        ui.label(RichText::new(format!("Window: {short}{more}")).small().color(t.muted))
+        ui.add(egui::Label::new(RichText::new(format!("Window: {titles}")).small().color(t.muted)).truncate())
             .on_hover_text(titles.replace(" | ", "\n"));
     }
 }
@@ -1061,9 +1060,9 @@ impl App {
             ui.label(RichText::new("Start a recording").strong());
             ui.horizontal(|ui| {
                 ui.label("Record for");
+                ui.selectable_value(&mut self.track_minutes, None, "Until I stop it");
                 ui.selectable_value(&mut self.track_minutes, Some(10), "10 minutes");
                 ui.selectable_value(&mut self.track_minutes, Some(30), "30 minutes");
-                ui.selectable_value(&mut self.track_minutes, None, "Until I stop it");
             });
             ui.add(egui::TextEdit::singleline(&mut self.track_filter).hint_text("Search by name or window title").desired_width(260.0));
             ui.add_space(4.0);
@@ -1084,9 +1083,12 @@ impl App {
                 return;
             }
             egui::ScrollArea::vertical().id_salt("track_pick").max_height(260.0).show(ui, |ui| {
+                // Memory, CPU and the Start button need about this much.
+                let name_w = (ui.available_width() - 260.0).max(240.0);
                 egui::Grid::new("track_pick_grid").num_columns(4).striped(true).spacing(vec2(18.0, 6.0)).show(ui, |ui| {
                     for r in rows {
                         ui.vertical(|ui| {
+                            ui.set_width(name_w);
                             let name = describe::display_name(&r.app, r.description.as_deref());
                             ui.label(RichText::new(&name).strong());
                             window_line(ui, t, r.titles.as_deref(), &name);
@@ -1544,6 +1546,8 @@ impl App {
                 ui.label(RichText::new(text).color(t.muted));
                 return;
             }
+            // Processes, CPU, Memory and the buttons need about this much.
+            let name_w = (ui.available_width() - 430.0).max(240.0);
             egui::Grid::new("running").num_columns(5).striped(true).spacing(vec2(18.0, 8.0)).show(ui, |ui| {
                 for h in ["App", "Processes", "CPU", "Memory", ""] {
                     ui.label(RichText::new(h).small().color(t.muted));
@@ -1551,7 +1555,7 @@ impl App {
                 ui.end_row();
                 for r in &rows {
                     ui.vertical(|ui| {
-                        ui.set_max_width(460.0);
+                        ui.set_width(name_w);
                         let name = describe::display_name(&r.app, r.description.as_deref());
                         ui.label(RichText::new(&name).strong());
                         ui.label(RichText::new(describe::explain(&r.app, r.description.as_deref())).small().color(t.text_2));
