@@ -10,7 +10,7 @@ Task Manager shows the last minute. JPerformance keeps a history.
 - **History**: CPU, memory, I/O and network charts for the last hour up to 30 days, and a weekday by hour map of when your PC is busiest. Hover any chart to see which apps were behind that point, and click to keep that moment open. A processes chart shows how many were running at once.
 - **Apps**: every app ranked by CPU, memory or I/O over a time range. Click one to see its own usage over time.
 - **Insights**: plain findings such as your busiest hour and what caused it, long stretches of high CPU, times memory was nearly full, and which app used the most of each resource.
-- **Auto close** (off until you turn it on): closes apps you pick once they go unused for 10 minutes to 2 hours. Apps with open windows are only asked to close (like clicking X) if you allow it. Windows system processes are never closed. Every close is listed with the memory it freed.
+- **Running apps**: every running app with its processes, CPU and memory, and a Stop app button. Stopping closes the app the same way as quitting it; nothing is uninstalled or deleted. If an app does not close, Force stop ends it after you confirm. Windows system processes cannot be stopped here.
 - **Background tracking**: a small helper process (`JPerformance.exe --collector`) keeps recording after you close the window. It can start when you sign in to Windows.
 
 All data stays on your PC in `%APPDATA%\JPerformance\jperformance.db` (SQLite). History older than 30 days is removed automatically; change that in Settings. History recorded under the old name (PerfLens) is copied over the first time JPerformance starts.
@@ -31,6 +31,7 @@ The app is `target\release\JPerformance.exe`.
 JPerformance.exe                 open the app (starts background tracking if it is on)
 JPerformance.exe --collector     run only the background recorder
 JPerformance.exe --report [h]    print the insights for the last h hours (default 24)
+JPerformance.exe --stop <app.exe> [--force]   stop a running app, like the Stop app button
 ```
 
 ## Notes

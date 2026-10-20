@@ -46,20 +46,6 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS autoclose_rules (
-    app          TEXT PRIMARY KEY,
-    idle_minutes INTEGER NOT NULL,
-    windowed     INTEGER NOT NULL DEFAULT 0,
-    added        INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS autoclose_log (
-    ts        INTEGER NOT NULL,
-    app       TEXT    NOT NULL,
-    processes INTEGER NOT NULL,
-    mem_freed INTEGER NOT NULL,
-    method    TEXT    NOT NULL
-);
-CREATE INDEX IF NOT EXISTS autoclose_log_ts ON autoclose_log(ts);
 CREATE TABLE IF NOT EXISTS collector_status (
     id        INTEGER PRIMARY KEY CHECK (id = 1),
     pid       INTEGER NOT NULL,
@@ -133,7 +119,6 @@ pub fn setting_i64(conn: &Connection, key: &str, default: i64) -> i64 {
 pub const KEY_TRACKING: &str = "tracking_enabled";
 pub const KEY_INTERVAL: &str = "sample_interval_secs";
 pub const KEY_RETENTION: &str = "retention_days";
-pub const KEY_AUTOCLOSE: &str = "autoclose_enabled";
 
 pub const DEFAULT_INTERVAL: i64 = 5;
 pub const DEFAULT_RETENTION: i64 = 30;
@@ -174,8 +159,6 @@ pub struct LiveApp {
     pub mem: u64,
     pub io_rate: f64,
     pub procs: i64,
-    /// last time the app was in front or busy
-    pub last_active: i64,
 }
 
 pub fn write_sample(conn: &mut Connection, s: &SystemSample, live: &[LiveApp]) -> Result<()> {
@@ -201,10 +184,10 @@ pub fn write_sample(conn: &mut Connection, s: &SystemSample, live: &[LiveApp]) -
     tx.execute("DELETE FROM live_apps", [])?;
     {
         let mut stmt = tx.prepare(
-            "INSERT INTO live_apps(app, cpu, mem, io_rate, procs, ts, last_active) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO live_apps(app, cpu, mem, io_rate, procs, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )?;
         for a in live {
-            stmt.execute(params![a.app, a.cpu, a.mem as i64, a.io_rate, a.procs, s.ts, a.last_active])?;
+            stmt.execute(params![a.app, a.cpu, a.mem as i64, a.io_rate, a.procs, s.ts])?;
         }
     }
     tx.execute(
@@ -364,13 +347,12 @@ pub struct LiveRow {
     pub mem: u64,
     pub io_rate: f64,
     pub procs: i64,
-    pub last_active: i64,
     pub exe_path: Option<String>,
 }
 
 pub fn live_apps(conn: &Connection) -> Result<Vec<LiveRow>> {
     let mut stmt = conn.prepare(
-        "SELECT l.app, a.description, l.cpu, l.mem, l.io_rate, l.procs, l.last_active, a.exe_path
+        "SELECT l.app, a.description, l.cpu, l.mem, l.io_rate, l.procs, a.exe_path
          FROM live_apps l LEFT JOIN apps a ON a.app = l.app
          ORDER BY l.cpu DESC, l.mem DESC",
     )?;
@@ -382,8 +364,7 @@ pub fn live_apps(conn: &Connection) -> Result<Vec<LiveRow>> {
             mem: r.get::<_, i64>(3)? as u64,
             io_rate: r.get(4)?,
             procs: r.get(5)?,
-            last_active: r.get(6)?,
-            exe_path: r.get(7)?,
+            exe_path: r.get(6)?,
         })
     })?;
     rows.collect()
@@ -543,83 +524,4 @@ pub fn db_size_bytes(path: &Path) -> u64 {
         total += std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
     }
     total
-}
-
-// ---------- auto close ----------
-
-pub fn app_exe(conn: &Connection, app: &str) -> Result<Option<String>> {
-    conn.query_row("SELECT exe_path FROM apps WHERE app = ?1", [app], |r| r.get(0))
-        .optional()
-        .map(Option::flatten)
-}
-
-#[derive(Clone, Debug)]
-pub struct CloseRule {
-    pub app: String,
-    pub idle_minutes: i64,
-    /// Also close the app when it has open windows (asks it to close, like clicking X).
-    pub windowed: bool,
-}
-
-pub fn autoclose_enabled(conn: &Connection) -> bool {
-    setting_i64(conn, KEY_AUTOCLOSE, 0) != 0
-}
-
-pub fn close_rules(conn: &Connection) -> Result<Vec<CloseRule>> {
-    let mut stmt = conn.prepare("SELECT app, idle_minutes, windowed FROM autoclose_rules ORDER BY app")?;
-    let rows = stmt.query_map([], |r| {
-        Ok(CloseRule { app: r.get(0)?, idle_minutes: r.get(1)?, windowed: r.get::<_, i64>(2)? != 0 })
-    })?;
-    rows.collect()
-}
-
-pub fn set_close_rule(conn: &Connection, rule: &CloseRule) -> Result<()> {
-    conn.execute(
-        "INSERT INTO autoclose_rules(app, idle_minutes, windowed, added) VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(app) DO UPDATE SET idle_minutes = excluded.idle_minutes, windowed = excluded.windowed",
-        params![rule.app, rule.idle_minutes, rule.windowed as i64, chrono::Utc::now().timestamp()],
-    )?;
-    Ok(())
-}
-
-pub fn delete_close_rule(conn: &Connection, app: &str) -> Result<()> {
-    conn.execute("DELETE FROM autoclose_rules WHERE app = ?1", [app])?;
-    Ok(())
-}
-
-pub fn log_close(conn: &Connection, app: &str, processes: i64, mem_freed: u64, method: &str) -> Result<()> {
-    conn.execute(
-        "INSERT INTO autoclose_log(ts, app, processes, mem_freed, method) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![chrono::Utc::now().timestamp(), app, processes, mem_freed as i64, method],
-    )?;
-    Ok(())
-}
-
-#[derive(Clone, Debug)]
-pub struct CloseEvent {
-    pub ts: i64,
-    pub app: String,
-    pub description: Option<String>,
-    pub processes: i64,
-    pub mem_freed: u64,
-    pub method: String,
-}
-
-pub fn recent_closes(conn: &Connection, limit: usize) -> Result<Vec<CloseEvent>> {
-    let mut stmt = conn.prepare(
-        "SELECT l.ts, l.app, a.description, l.processes, l.mem_freed, l.method
-         FROM autoclose_log l LEFT JOIN apps a ON a.app = l.app
-         ORDER BY l.ts DESC LIMIT ?1",
-    )?;
-    let rows = stmt.query_map([limit as i64], |r| {
-        Ok(CloseEvent {
-            ts: r.get(0)?,
-            app: r.get(1)?,
-            description: r.get(2)?,
-            processes: r.get(3)?,
-            mem_freed: r.get::<_, i64>(4)? as u64,
-            method: r.get(5)?,
-        })
-    })?;
-    rows.collect()
 }

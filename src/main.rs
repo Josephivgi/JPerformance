@@ -1,6 +1,5 @@
 #![windows_subsystem = "windows"]
 
-mod autoclose;
 mod autostart;
 mod collector;
 mod db;
@@ -8,6 +7,7 @@ mod describe;
 mod fmt;
 mod insights;
 mod paths;
+mod procs;
 mod theme;
 mod ui;
 
@@ -58,6 +58,22 @@ fn main() {
                 eprintln!("report failed: {e}");
                 std::process::exit(1);
             }
+        }
+        Some("--stop") => {
+            attach_console();
+            let Some(app) = args.get(1) else {
+                eprintln!("usage: JPerformance.exe --stop <app.exe> [--force]");
+                std::process::exit(2);
+            };
+            let force = args.get(2).is_some_and(|a| a == "--force");
+            let msg = match procs::stop(app, force) {
+                procs::StopResult::AskedToClose => "asked to close".to_string(),
+                procs::StopResult::Ended(n) => format!("stopped {n} process(es)"),
+                procs::StopResult::NotRunning => "not running".to_string(),
+                procs::StopResult::Denied => "Windows refused (it may run as administrator)".to_string(),
+                procs::StopResult::Protected => "part of Windows, not stopped".to_string(),
+            };
+            println!("{app}: {msg}");
         }
         _ => {
             if let Err(e) = ui::run() {

@@ -1,6 +1,6 @@
 use crate::insights::{Insight, Severity};
 use crate::theme::{self, Tokens};
-use crate::{autoclose, autostart, collector, db, describe, fmt, insights, paths};
+use crate::{autostart, collector, db, describe, fmt, insights, paths, procs};
 use eframe::egui::{self, Color32, RichText, Sense, Stroke, Ui, vec2};
 use egui_plot::{Line, Plot, PlotPoints, Points, VLine};
 use rusqlite::Connection;
@@ -25,7 +25,7 @@ enum Page {
     History,
     Apps,
     Insights,
-    AutoClose,
+    Running,
     Settings,
 }
 
@@ -62,6 +62,13 @@ impl Range {
     fn bucket(self) -> i64 {
         (self.secs() / 360).max(5)
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunSort {
+    Memory,
+    Cpu,
+    Name,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -122,9 +129,12 @@ struct App {
     app_series: Vec<db::AppPoint>,
     insights: Vec<Insight>,
     tips: TipCache,
-    rules: Vec<db::CloseRule>,
-    closes: Vec<db::CloseEvent>,
-    autoclose_on: bool,
+    run_filter: String,
+    run_sort: RunSort,
+    run_notice: Option<(String, bool)>,
+    /// When each app was last asked to stop.
+    stops: HashMap<String, Instant>,
+    confirm_force: Option<String>,
 
     tracking: bool,
     autostart: bool,
@@ -140,7 +150,6 @@ impl App {
         theme::install(&cc.egui_ctx);
         let conn = db::open(&paths::db_path())?;
         let tracking = db::tracking_enabled(&conn);
-        let autoclose_on = db::autoclose_enabled(&conn);
         if tracking {
             if let Err(e) = collector::spawn_detached() {
                 collector::log(&format!("could not start collector: {e}"));
@@ -172,9 +181,11 @@ impl App {
             app_series: Vec::new(),
             insights: Vec::new(),
             tips: TipCache::default(),
-            rules: Vec::new(),
-            closes: Vec::new(),
-            autoclose_on,
+            run_filter: String::new(),
+            run_sort: RunSort::Memory,
+            run_notice: None,
+            stops: HashMap::new(),
+            confirm_force: None,
             tracking,
             autostart: autostart::is_enabled(),
             confirm_clear: false,
@@ -192,8 +203,6 @@ impl App {
                 self.recent = db::system_series(&self.conn, now - 15 * 60, now, 1)?;
                 self.live = db::live_apps(&self.conn)?;
                 self.status = db::collector_status(&self.conn)?;
-                self.rules = db::close_rules(&self.conn)?;
-                self.closes = db::recent_closes(&self.conn, 20)?;
                 self.tips.map.clear();
                 Ok(())
             })();
@@ -409,13 +418,16 @@ impl eframe::App for App {
                     Page::History => self.page_history(ui, &t),
                     Page::Apps => self.page_apps(ui, &t),
                     Page::Insights => self.page_insights(ui, &t),
-                    Page::AutoClose => self.page_autoclose(ui, &t),
+                    Page::Running => self.page_running(ui, &t),
                     Page::Settings => self.page_settings(ui, &t),
                 });
             });
 
         if self.confirm_clear {
             self.clear_dialog(ui, &t);
+        }
+        if self.confirm_force.is_some() {
+            self.force_dialog(ui, &t);
         }
     }
 }
@@ -692,10 +704,10 @@ impl App {
         ui.add_space(18.0);
         for (page, label) in [
             (Page::Now, "Right now"),
+            (Page::Running, "Running apps"),
             (Page::History, "History"),
             (Page::Apps, "Apps"),
             (Page::Insights, "Insights"),
-            (Page::AutoClose, "Auto close"),
             (Page::Settings, "Settings"),
         ] {
             let selected = self.page == page;
@@ -900,7 +912,6 @@ impl App {
                     });
                 });
                 ui.label(RichText::new(describe::explain(&app, desc.as_deref())).color(t.text_2));
-                self.autoclose_toggle(ui, t, &app);
                 if let Some(s) = &summary {
                     ui.add_space(4.0);
                     ui.label(format!(
@@ -1057,189 +1068,161 @@ impl App {
         }
     }
 
-    fn save_rule(&mut self, rule: db::CloseRule) {
-        match db::set_close_rule(&self.conn, &rule) {
-            Ok(()) => self.last_live = None,
-            Err(e) => self.error = Some(format!("Could not save auto close rule: {e}")),
-        }
-    }
-
-    fn remove_rule(&mut self, app: &str) {
-        match db::delete_close_rule(&self.conn, app) {
-            Ok(()) => self.last_live = None,
-            Err(e) => self.error = Some(format!("Could not remove auto close rule: {e}")),
-        }
-    }
-
-    /// "Close when unused" switch shown on an app's detail card.
-    fn autoclose_toggle(&mut self, ui: &mut Ui, t: &Tokens, app: &str) {
-        let exe = db::app_exe(&self.conn, app).ok().flatten();
-        if autoclose::is_protected(app, exe.as_deref()) {
-            ui.label(RichText::new("Part of Windows, so it is never closed automatically.").small().color(t.muted));
-            return;
-        }
-        let mut on = self.rules.iter().any(|r| r.app == app);
-        if ui.checkbox(&mut on, "Close this app automatically when I am not using it").changed() {
-            if on {
-                self.save_rule(db::CloseRule { app: app.to_string(), idle_minutes: 30, windowed: false });
-            } else {
-                self.remove_rule(app);
+    fn stop_app(&mut self, app: &str, force: bool) {
+        let desc = self.live.iter().find(|r| r.app == app).and_then(|r| r.description.clone());
+        let name = describe::display_name(app, desc.as_deref());
+        let (msg, is_err) = match procs::stop(app, force) {
+            procs::StopResult::AskedToClose => (
+                format!("Asked {name} to close. If it has unsaved work, it may ask you to save first."),
+                false,
+            ),
+            procs::StopResult::Ended(n) => {
+                (format!("Stopped {name} ({n} process{}).", if n == 1 { "" } else { "es" }), false)
             }
-        }
-        if on && !self.autoclose_on {
-            ui.label(RichText::new("Auto close is turned off. Turn it on in the Auto close page.").small().color(t.warning));
-        }
-    }
-
-    fn page_autoclose(&mut self, ui: &mut Ui, t: &Tokens) {
-        heading(ui, t, "Auto close", "Close apps you are not using to free up memory and CPU.");
-        let now = chrono::Utc::now().timestamp();
-
-        theme::card(t).show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            let mut on = self.autoclose_on;
-            if ui.checkbox(&mut on, RichText::new("Close unused apps automatically").strong()).changed() {
-                match db::set_setting(&self.conn, db::KEY_AUTOCLOSE, if on { "1" } else { "0" }) {
-                    Ok(()) => self.autoclose_on = on,
-                    Err(e) => self.error = Some(format!("Could not save setting: {e}")),
-                }
-            }
-            ui.label(
-                RichText::new(
-                    "Only the apps in the list below are closed. An app counts as unused when it is not the app you are using \
-                     and it stays under 1% of one CPU core for the time you pick. Apps with open windows are left alone unless you \
-                     allow it, and then they are asked to close the same way as clicking X, so they can ask you to save. \
-                     Windows system processes are never closed.",
-                )
-                .color(t.text_2),
-            );
-            if !self.tracking {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    status_dot(ui, t.warning);
-                    ui.label(RichText::new("Background tracking is off, so nothing will be closed. Turn it on in Settings.").color(t.text_2));
-                });
-            }
-        });
-
-        // Usage per running app, from the latest sample.
-        let live: HashMap<String, i64> = self.live.iter().map(|r| (r.app.clone(), r.last_active)).collect();
-        let unused_for = |app: &str| -> String {
-            match live.get(app) {
-                Some(&last) if now - last < 60 => "In use".into(),
-                Some(&last) => format!("Unused for {}", fmt::duration(now - last)),
-                None => "Not running, or using very little".into(),
-            }
+            procs::StopResult::NotRunning => (format!("{name} is not running anymore."), false),
+            procs::StopResult::Denied => (
+                format!("Windows did not let JPerformance stop {name}. It may be running as administrator."),
+                true,
+            ),
+            procs::StopResult::Protected => (format!("{name} is part of Windows, so JPerformance does not stop it."), true),
         };
+        self.run_notice = Some((msg, is_err));
+        self.stops.insert(app.to_string(), Instant::now());
+        self.last_live = None;
+    }
 
-        section(ui, t, "Apps that can be closed");
-        let mut changed: Option<db::CloseRule> = None;
-        let mut removed: Option<String> = None;
-        theme::card(t).show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            if self.rules.is_empty() {
-                ui.label(RichText::new("No apps yet. Add one from the list below, or from an app's page in Apps.").color(t.muted));
-                return;
-            }
-            egui::Grid::new("rules").num_columns(4).striped(true).spacing(vec2(18.0, 8.0)).show(ui, |ui| {
-                for h in ["App", "Close after unused for", "Apps with open windows", ""] {
-                    ui.label(RichText::new(h).small().color(t.muted));
-                }
-                ui.end_row();
-                for r in &self.rules {
-                    let desc = self.apps.iter().find(|a| a.app == r.app).and_then(|a| a.description.clone());
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new(describe::display_name(&r.app, desc.as_deref())).strong());
-                        ui.label(RichText::new(unused_for(&r.app)).small().color(t.text_2));
-                    });
-                    ui.horizontal(|ui| {
-                        for m in [10i64, 30, 60, 120] {
-                            let label = if m < 60 { format!("{m} min") } else { format!("{} h", m / 60) };
-                            if ui.selectable_label(r.idle_minutes == m, label).clicked() {
-                                changed = Some(db::CloseRule { idle_minutes: m, ..r.clone() });
-                            }
-                        }
-                    });
-                    let mut windowed = r.windowed;
-                    if ui.checkbox(&mut windowed, "Ask them to close too").changed() {
-                        changed = Some(db::CloseRule { windowed, ..r.clone() });
-                    }
-                    if ui.button("Remove").clicked() {
-                        removed = Some(r.app.clone());
-                    }
-                    ui.end_row();
-                }
+    fn page_running(&mut self, ui: &mut Ui, t: &Tokens) {
+        heading(
+            ui,
+            t,
+            "Running apps",
+            "Every app running right now. Stopping an app closes it, the same as quitting it. Nothing is uninstalled or deleted, and you can open it again any time.",
+        );
+        let total_procs: i64 = self.live.iter().map(|r| r.procs).sum();
+        ui.label(RichText::new(format!("{} apps, {} processes", self.live.len(), total_procs)).color(t.text_2));
+        ui.add_space(6.0);
+        if let Some((msg, is_err)) = &self.run_notice {
+            ui.horizontal(|ui| {
+                status_dot(ui, if *is_err { t.critical } else { t.good });
+                ui.label(RichText::new(msg).color(t.text_2));
             });
+            ui.add_space(6.0);
+        }
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.run_filter).hint_text("Search apps").desired_width(220.0));
+            ui.add_space(12.0);
+            ui.label(RichText::new("Sort by").color(t.text_2));
+            ui.selectable_value(&mut self.run_sort, RunSort::Memory, "Memory");
+            ui.selectable_value(&mut self.run_sort, RunSort::Cpu, "CPU");
+            ui.selectable_value(&mut self.run_sort, RunSort::Name, "Name");
         });
-        if let Some(r) = changed {
-            self.save_rule(r);
-        }
-        if let Some(app) = removed {
-            self.remove_rule(&app);
-        }
+        ui.add_space(6.0);
 
-        section(ui, t, "Running apps you could add");
-        ui.label(RichText::new("Sorted by memory. Windows system processes are not listed.").small().color(t.muted));
-        ui.add_space(4.0);
-        let mut candidates: Vec<&db::LiveRow> = self
+        let filter = self.run_filter.to_lowercase();
+        let mut rows: Vec<db::LiveRow> = self
             .live
             .iter()
-            .filter(|r| !autoclose::is_protected(&r.app, r.exe_path.as_deref()))
-            .filter(|r| !self.rules.iter().any(|x| x.app == r.app))
+            .filter(|r| {
+                filter.is_empty()
+                    || r.app.to_lowercase().contains(&filter)
+                    || r.description.as_deref().unwrap_or("").to_lowercase().contains(&filter)
+            })
+            .cloned()
             .collect();
-        candidates.sort_by(|a, b| b.mem.cmp(&a.mem));
-        let mut add: Option<String> = None;
+        match self.run_sort {
+            RunSort::Memory => rows.sort_by(|a, b| b.mem.cmp(&a.mem)),
+            RunSort::Cpu => rows.sort_by(|a, b| b.cpu.total_cmp(&a.cpu)),
+            RunSort::Name => rows.sort_by_key(|r| describe::display_name(&r.app, r.description.as_deref()).to_lowercase()),
+        }
+
+        let mut stop: Option<String> = None;
+        let mut force: Option<String> = None;
         theme::card(t).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            if candidates.is_empty() {
-                ui.label(RichText::new("Waiting for the background tracker to report running apps.").color(t.muted));
+            if rows.is_empty() {
+                let text = if self.live.is_empty() {
+                    "Waiting for the background tracker. Turn on background tracking in Settings if this stays empty."
+                } else {
+                    "No running apps match your search."
+                };
+                ui.label(RichText::new(text).color(t.muted));
                 return;
             }
-            egui::Grid::new("candidates").num_columns(4).striped(true).spacing(vec2(18.0, 8.0)).show(ui, |ui| {
-                for h in ["App", "Memory", "Activity", ""] {
+            egui::Grid::new("running").num_columns(5).striped(true).spacing(vec2(18.0, 8.0)).show(ui, |ui| {
+                for h in ["App", "Processes", "CPU", "Memory", ""] {
                     ui.label(RichText::new(h).small().color(t.muted));
                 }
                 ui.end_row();
-                for r in candidates.iter().take(20) {
+                for r in &rows {
                     ui.vertical(|ui| {
-                        ui.set_max_width(420.0);
+                        ui.set_max_width(460.0);
                         ui.label(RichText::new(describe::display_name(&r.app, r.description.as_deref())).strong());
                         ui.label(RichText::new(describe::explain(&r.app, r.description.as_deref())).small().color(t.text_2));
                     });
+                    ui.label(r.procs.to_string());
+                    ui.label(fmt::pct(r.cpu));
                     ui.label(fmt::bytes(r.mem as f64));
-                    ui.label(unused_for(&r.app));
-                    if ui.button("Add").clicked() {
-                        add = Some(r.app.clone());
+                    if procs::is_protected(&r.app, r.exe_path.as_deref()) {
+                        ui.label(RichText::new("Part of Windows").small().color(t.muted))
+                            .on_hover_text("JPerformance does not stop Windows system processes.");
+                    } else {
+                        match self.stops.get(&r.app).map(|at| at.elapsed()) {
+                            Some(e) if e < Duration::from_secs(8) => {
+                                ui.label(RichText::new("Closing").color(t.text_2));
+                            }
+                            Some(_) => {
+                                if ui
+                                    .button(RichText::new("Force stop").color(t.critical))
+                                    .on_hover_text("It is still running. Ends it right away; unsaved work is lost.")
+                                    .clicked()
+                                {
+                                    force = Some(r.app.clone());
+                                }
+                            }
+                            None => {
+                                if ui.button("Stop app").clicked() {
+                                    stop = Some(r.app.clone());
+                                }
+                            }
+                        }
                     }
                     ui.end_row();
                 }
             });
         });
-        if let Some(app) = add {
-            self.save_rule(db::CloseRule { app, idle_minutes: 30, windowed: false });
+        if let Some(app) = stop {
+            self.stop_app(&app, false);
         }
+        if let Some(app) = force {
+            self.confirm_force = Some(app);
+        }
+        // Forget stop attempts for apps that have closed.
+        let running: std::collections::HashSet<&str> = self.live.iter().map(|r| r.app.as_str()).collect();
+        self.stops.retain(|app, at| running.contains(app.as_str()) || at.elapsed() < Duration::from_secs(8));
+    }
 
-        section(ui, t, "Recently closed");
-        theme::card(t).show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            if self.closes.is_empty() {
-                ui.label(RichText::new("Nothing has been closed yet.").color(t.muted));
-                return;
-            }
-            egui::Grid::new("closes").num_columns(4).striped(true).spacing(vec2(18.0, 6.0)).show(ui, |ui| {
-                for h in ["When", "App", "What happened", "Memory freed"] {
-                    ui.label(RichText::new(h).small().color(t.muted));
+    fn force_dialog(&mut self, ui: &mut Ui, t: &Tokens) {
+        let Some(app) = self.confirm_force.clone() else { return };
+        let desc = self.live.iter().find(|r| r.app == app).and_then(|r| r.description.clone());
+        let name = describe::display_name(&app, desc.as_deref());
+        let resp = egui::Modal::new(egui::Id::unique("confirm_force")).show(ui.ctx(), |ui| {
+            ui.set_width(380.0);
+            ui.label(RichText::new(format!("Force stop {name}?")).size(16.0).strong());
+            ui.label(RichText::new("It did not close when asked. Forcing it ends it right away, and any unsaved work in it is lost.").color(t.text_2));
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button(RichText::new("Force stop").color(t.critical)).clicked() {
+                    self.stop_app(&app, true);
+                    self.confirm_force = None;
                 }
-                ui.end_row();
-                for c in &self.closes {
-                    ui.label(fmt::day_time(c.ts));
-                    ui.label(describe::display_name(&c.app, c.description.as_deref()));
-                    ui.label(format!("{} ({} process{})", c.method, c.processes, if c.processes == 1 { "" } else { "es" }));
-                    ui.label(if c.mem_freed > 0 { fmt::bytes(c.mem_freed as f64) } else { "None".into() });
-                    ui.end_row();
+                if ui.button("Cancel").clicked() {
+                    self.confirm_force = None;
                 }
             });
         });
+        if resp.should_close() {
+            self.confirm_force = None;
+        }
     }
 
     fn page_settings(&mut self, ui: &mut Ui, t: &Tokens) {
