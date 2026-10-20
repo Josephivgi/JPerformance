@@ -12,9 +12,9 @@ Task Manager shows the last minute. JPerformance keeps a history.
 - **Apps**: every app ranked by CPU, memory or I/O over a time range. Click one to see its own usage over time.
 - **Insights**: plain findings such as your busiest hour and what caused it, long stretches of high CPU, times memory was nearly full, and which app used the most of each resource.
 - **Running apps**: every running app with its processes, CPU and memory, and a Stop app button. Stopping closes the app the same way as quitting it; nothing is uninstalled or deleted. If an app does not close, Force stop ends it after you confirm. Windows system processes cannot be stopped here.
-- **Background tracking**: a small helper process (`JPerformance.exe --collector`) keeps recording after you close the window. It can start when you sign in to Windows.
+- **Background tracking**: always on. A small helper process (`JPerformance.exe --collector`) keeps recording after you close the window. Tick **Start with Windows** at the bottom of the menu to keep tracking after a restart.
 
-All data stays on your PC in `%APPDATA%\JPerformance\jperformance.db` (SQLite). History older than 30 days is removed automatically; change that in Settings. History recorded under the old name (PerfLens) is copied over the first time JPerformance starts.
+All data stays on your PC in `%APPDATA%\JPerformance\jperformance.db` (SQLite). It takes a sample every 5 seconds and removes history older than 30 days automatically. There are no settings to manage. History recorded under the old name (PerfLens) is copied over the first time JPerformance starts.
 
 ## Build
 

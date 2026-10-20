@@ -296,17 +296,6 @@ pub fn prune(conn: &Connection, older_than: i64) -> Result<usize> {
     Ok(a + b)
 }
 
-pub fn clear_history(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "BEGIN;
-         DELETE FROM system_samples;
-         DELETE FROM app_minutes;
-         DELETE FROM live_apps;
-         COMMIT;
-         VACUUM;",
-    )
-}
-
 // ---------- reads ----------
 
 #[derive(Clone, Debug)]
@@ -580,27 +569,16 @@ pub fn coverage(conn: &Connection, from: i64, to: i64) -> Result<Coverage> {
 }
 
 pub struct CollectorStatus {
-    pub pid: i64,
-    pub started: i64,
     pub heartbeat: i64,
 }
 
 pub fn collector_status(conn: &Connection) -> Result<Option<CollectorStatus>> {
     conn.query_row(
-        "SELECT pid, started, heartbeat FROM collector_status WHERE id = 1",
+        "SELECT heartbeat FROM collector_status WHERE id = 1",
         [],
-        |r| Ok(CollectorStatus { pid: r.get(0)?, started: r.get(1)?, heartbeat: r.get(2)? }),
+        |r| Ok(CollectorStatus { heartbeat: r.get(0)? }),
     )
     .optional()
-}
-
-pub fn db_size_bytes(path: &Path) -> u64 {
-    let mut total = 0;
-    for suffix in ["", "-wal", "-shm"] {
-        let p = std::path::PathBuf::from(format!("{}{}", path.display(), suffix));
-        total += std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-    }
-    total
 }
 
 // ---------- app recordings ("Track an app") ----------

@@ -27,7 +27,6 @@ enum Page {
     Insights,
     Running,
     Track,
-    Settings,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -147,12 +146,8 @@ struct App {
     session_points: Vec<db::AppPoint>,
     confirm_delete_session: Option<i64>,
 
-    tracking: bool,
     autostart: bool,
     interval: i64,
-    retention: i64,
-    confirm_clear: bool,
-    notice: Option<(String, bool)>,
     error: Option<String>,
 }
 
@@ -160,16 +155,14 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         theme::install(&cc.egui_ctx);
         let conn = db::open(&paths::db_path())?;
-        let tracking = db::tracking_enabled(&conn);
-        if tracking {
-            if let Err(e) = collector::spawn_detached() {
-                collector::log(&format!("could not start collector: {e}"));
-            }
+        // Background tracking is always on; opening the app makes sure it runs.
+        db::set_setting(&conn, db::KEY_TRACKING, "1")?;
+        if let Err(e) = collector::spawn_detached() {
+            collector::log(&format!("could not start collector: {e}"));
         }
         autostart::refresh_path();
         Ok(Self {
             interval: db::setting_i64(&conn, db::KEY_INTERVAL, db::DEFAULT_INTERVAL),
-            retention: db::setting_i64(&conn, db::KEY_RETENTION, db::DEFAULT_RETENTION),
             conn,
             page: Page::Now,
             range: Range::H24,
@@ -206,10 +199,7 @@ impl App {
             view_session: None,
             session_points: Vec::new(),
             confirm_delete_session: None,
-            tracking,
             autostart: autostart::is_enabled(),
-            confirm_clear: false,
-            notice: None,
             error: None,
         })
     }
@@ -270,19 +260,9 @@ impl App {
         }
     }
 
-    fn set_tracking(&mut self, on: bool) {
-        self.tracking = on;
-        if let Err(e) = db::set_setting(&self.conn, db::KEY_TRACKING, if on { "1" } else { "0" }) {
-            self.notice = Some((format!("Could not save setting: {e}"), true));
-            return;
-        }
-        if on {
-            match collector::spawn_detached() {
-                Ok(()) => self.notice = Some(("Background tracking started.".into(), false)),
-                Err(e) => self.notice = Some((format!("Could not start tracking: {e}"), true)),
-            }
-        } else {
-            self.notice = Some(("Background tracking will stop within a few seconds.".into(), false));
+    fn start_collector(&mut self) {
+        if let Err(e) = collector::spawn_detached() {
+            self.error = Some(format!("Could not start background tracking: {e}"));
         }
         self.last_live = None;
     }
@@ -469,13 +449,9 @@ impl eframe::App for App {
                     Page::Insights => self.page_insights(ui, &t),
                     Page::Running => self.page_running(ui, &t),
                     Page::Track => self.page_track(ui, &t),
-                    Page::Settings => self.page_settings(ui, &t),
                 });
             });
 
-        if self.confirm_clear {
-            self.clear_dialog(ui, &t);
-        }
         if self.confirm_force.is_some() {
             self.force_dialog(ui, &t);
         }
@@ -762,7 +738,6 @@ impl App {
             (Page::History, "History"),
             (Page::Apps, "Apps"),
             (Page::Insights, "Insights"),
-            (Page::Settings, "Settings"),
         ] {
             let selected = self.page == page;
             let text = if selected { RichText::new(label).strong() } else { RichText::new(label) };
@@ -773,12 +748,22 @@ impl App {
         }
 
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            let mut auto = self.autostart;
+            if ui
+                .checkbox(&mut auto, RichText::new("Start with Windows").small())
+                .on_hover_text("Keep tracking after you restart your PC.")
+                .changed()
+            {
+                match autostart::set_enabled(auto) {
+                    Ok(()) => self.autostart = auto,
+                    Err(e) => self.error = Some(format!("Could not change the startup option: {e}")),
+                }
+            }
+            ui.add_space(6.0);
             let (color, text) = if self.collector_running {
                 (t.good, "Tracking in background")
-            } else if self.tracking {
-                (t.warning, "Tracking is starting")
             } else {
-                (t.muted, "Tracking is off")
+                (t.warning, "Tracking is starting")
             };
             if let Some(s) = &self.status {
                 if self.collector_running {
@@ -797,9 +782,9 @@ impl App {
         if !self.collector_running && self.latest.as_ref().is_none_or(|(p, _)| chrono::Utc::now().timestamp() - p.ts > 60) {
             theme::card(t).show(ui, |ui| {
                 ui.label(RichText::new("Background tracking is not running").strong());
-                ui.label(RichText::new("Turn it on to record performance over time.").color(t.text_2));
+                ui.label(RichText::new("It records performance over time, even when this window is closed.").color(t.text_2));
                 if ui.button("Start tracking").clicked() {
-                    self.set_tracking(true);
+                    self.start_collector();
                 }
             });
             ui.add_space(theme::GAP);
@@ -1018,11 +1003,6 @@ impl App {
     }
 
     fn start_tracking(&mut self, app: &str) {
-        if !self.tracking {
-            self.track_notice = Some(("Background tracking is off. Turn it on in Settings to record an app.".into(), true));
-            self.page = Page::Track;
-            return;
-        }
         if !self.collector_running {
             let _ = collector::spawn_detached();
         }
@@ -1539,7 +1519,7 @@ impl App {
             ui.set_min_width(ui.available_width());
             if rows.is_empty() {
                 let text = if self.live.is_empty() {
-                    "Waiting for the background tracker. Turn on background tracking in Settings if this stays empty."
+                    "Waiting for the background tracker to report running apps."
                 } else {
                     "No running apps match your search."
                 };
@@ -1632,116 +1612,6 @@ impl App {
         });
         if resp.should_close() {
             self.confirm_force = None;
-        }
-    }
-
-    fn page_settings(&mut self, ui: &mut Ui, t: &Tokens) {
-        heading(ui, t, "Settings", "");
-        if let Some((msg, is_err)) = &self.notice {
-            ui.colored_label(if *is_err { t.critical } else { t.text_2 }, msg);
-            ui.add_space(8.0);
-        }
-
-        theme::card(t).show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.label(RichText::new("Background tracking").strong());
-            ui.label(
-                RichText::new("A small helper process records performance even when this window is closed.").color(t.text_2),
-            );
-            ui.add_space(6.0);
-            let mut on = self.tracking;
-            if ui.checkbox(&mut on, "Record performance in the background").changed() {
-                self.set_tracking(on);
-            }
-            let mut auto = self.autostart;
-            if ui.checkbox(&mut auto, "Start tracking when I sign in to Windows").changed() {
-                match autostart::set_enabled(auto) {
-                    Ok(()) => self.autostart = auto,
-                    Err(e) => self.notice = Some((format!("Could not change startup setting: {e}"), true)),
-                }
-            }
-            if let Some(s) = &self.status {
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(if self.collector_running {
-                        format!("Running as process {} since {}.", s.pid, fmt::day_time(s.started))
-                    } else {
-                        format!("Last ran as process {}, last sample {}.", s.pid, fmt::ago(s.heartbeat))
-                    })
-                    .small()
-                    .color(t.muted),
-                );
-            }
-        });
-        ui.add_space(theme::GAP);
-
-        theme::card(t).show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.label(RichText::new("Recording").strong());
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label("Take a sample every");
-                for s in [2i64, 5, 10, 30] {
-                    if ui.selectable_label(self.interval == s, format!("{s} s")).clicked() {
-                        self.interval = s;
-                        let _ = db::set_setting(&self.conn, db::KEY_INTERVAL, &s.to_string());
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Keep history for");
-                for d in [7i64, 14, 30, 90] {
-                    if ui.selectable_label(self.retention == d, format!("{d} days")).clicked() {
-                        self.retention = d;
-                        let _ = db::set_setting(&self.conn, db::KEY_RETENTION, &d.to_string());
-                    }
-                }
-            });
-            ui.label(RichText::new("Older samples are removed automatically once an hour.").small().color(t.muted));
-        });
-        ui.add_space(theme::GAP);
-
-        theme::card(t).show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.label(RichText::new("Your data").strong());
-            let path = paths::db_path();
-            ui.label(RichText::new(format!("{}  ({})", path.display(), fmt::bytes(db::db_size_bytes(&path) as f64))).color(t.text_2));
-            ui.label(RichText::new("Everything stays on this PC. Nothing is uploaded.").small().color(t.muted));
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button("Open data folder").clicked() {
-                    let _ = std::process::Command::new("explorer").arg(paths::data_dir()).spawn();
-                }
-                if ui.button(RichText::new("Clear history").color(t.critical)).clicked() {
-                    self.confirm_clear = true;
-                }
-            });
-        });
-    }
-
-    fn clear_dialog(&mut self, ui: &mut Ui, t: &Tokens) {
-        let resp = egui::Modal::new(egui::Id::unique("confirm_clear")).show(ui.ctx(), |ui| {
-            ui.set_width(360.0);
-            ui.label(RichText::new("Clear all recorded history?").size(16.0).strong());
-            ui.label(RichText::new("This permanently deletes every sample and app record. Settings and saved app recordings are kept.").color(t.text_2));
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if ui.button(RichText::new("Delete history").color(t.critical)).clicked() {
-                    match db::clear_history(&self.conn) {
-                        Ok(()) => self.notice = Some(("History cleared.".into(), false)),
-                        Err(e) => self.notice = Some((format!("Could not clear history: {e}"), true)),
-                    }
-                    self.range_dirty = true;
-                    self.last_live = None;
-                    self.confirm_clear = false;
-                }
-                if ui.button("Cancel").clicked() {
-                    self.confirm_clear = false;
-                }
-            });
-        });
-        if resp.should_close() {
-            self.confirm_clear = false;
         }
     }
 }
