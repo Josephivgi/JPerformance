@@ -47,6 +47,8 @@ JPerformance.exe                 open the app (starts background tracking if it 
 JPerformance.exe --collector     run only the background recorder
 JPerformance.exe --report [h]    print the insights for the last h hours (default 24)
 JPerformance.exe --stop <app.exe> [--force]   stop a running app, like the Stop app button
+JPerformance.exe --check-update  say whether a newer release is available
+JPerformance.exe --update        download, verify and install the newest release, then restart
 ```
 
 ## Notes

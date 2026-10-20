@@ -185,6 +185,31 @@ impl Updater {
     }
 }
 
+/// `--check-update` prints whether a newer release exists; `--update` also installs it.
+pub fn cli(install: bool) -> Result<(), String> {
+    println!("JPerformance {CURRENT}");
+    let rel = match latest()? {
+        Some(r) if is_newer(&r.version, CURRENT) => r,
+        Some(r) => {
+            println!("Up to date (latest release is {}).", r.version);
+            return Ok(());
+        }
+        None => {
+            println!("No releases published yet.");
+            return Ok(());
+        }
+    };
+    println!("Version {} is available: {}", rel.version, rel.page);
+    if !install {
+        return Ok(());
+    }
+    let file = download(&rel, |_, _| {})?;
+    println!("Downloaded and verified {} bytes, sha256 {}", rel.size, rel.sha256);
+    swap_and_restart(&file)?;
+    println!("Installed {}. JPerformance is restarting.", rel.version);
+    Ok(())
+}
+
 fn update_dir() -> PathBuf {
     let dir = paths::data_dir().join("update");
     let _ = std::fs::create_dir_all(&dir);

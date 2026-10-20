@@ -61,6 +61,13 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some(flag @ ("--check-update" | "--update")) => {
+            attach_console();
+            if let Err(e) = update::cli(flag == "--update") {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
         Some("--stop") => {
             attach_console();
             let Some(app) = args.get(1) else {
