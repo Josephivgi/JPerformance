@@ -16,6 +16,20 @@ Task Manager shows the last minute. JPerformance keeps a history.
 
 All data stays on your PC in `%APPDATA%\JPerformance\jperformance.db` (SQLite). It takes a sample every 5 seconds and removes history older than 30 days automatically. There are no settings to manage. History recorded under the old name (PerfLens) is copied over the first time JPerformance starts.
 
+## Download and updates
+
+Download `JPerformance.exe` from the [latest release](https://github.com/Josephivgi/JPerformance/releases/latest) and run it from a folder you can write to (Desktop, Documents, or a folder of your own, not Program Files).
+
+JPerformance checks for a new release when it opens and every 6 hours. When there is one, a card at the top of the window offers **Install and restart**, **What's new**, **Later** and **Skip this version**. Nothing is installed unless you choose to. The download is checked against the SHA-256 that GitHub publishes for the release before it replaces the app. You can also press **Check for updates** at the bottom of the menu.
+
+## Releasing a new version
+
+1. Bump `version` in `Cargo.toml` (for example `0.2.0`) and run `cargo build` so `Cargo.lock` updates.
+2. Write the notes users will see in `release-notes/v0.2.0.md`.
+3. Commit, then `git tag v0.2.0` and `git push origin master v0.2.0`.
+
+The Release workflow builds `JPerformance.exe` on GitHub and publishes the release. Every copy of the app then offers the update.
+
 ## Build
 
 Requires Rust (MSVC toolchain).

@@ -581,6 +581,13 @@ pub fn collector_status(conn: &Connection) -> Result<Option<CollectorStatus>> {
     .optional()
 }
 
+/// Process id of the last collector that started.
+pub fn collector_pid(conn: &Connection) -> Result<Option<u32>> {
+    conn.query_row("SELECT pid FROM collector_status WHERE id = 1", [], |r| r.get::<_, i64>(0))
+        .optional()
+        .map(|p| p.map(|p| p as u32))
+}
+
 // ---------- app recordings ("Track an app") ----------
 
 /// Starts recording `app`. With `minutes`, the recording stops by itself after that long.

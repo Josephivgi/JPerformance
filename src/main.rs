@@ -11,6 +11,7 @@ mod procs;
 mod recorder;
 mod theme;
 mod ui;
+mod update;
 
 fn attach_console() {
     use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};

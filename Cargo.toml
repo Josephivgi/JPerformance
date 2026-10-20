@@ -13,7 +13,10 @@ chrono = "0.4.45"
 eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "links", "glow"] }
 egui_plot = "0.38.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11.1"
 sysinfo = "0.39.6"
+ureq = { version = "3", features = ["json"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_Console", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 winreg = "0.56.0"
 
