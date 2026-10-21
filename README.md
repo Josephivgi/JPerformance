@@ -57,3 +57,7 @@ JPerformance.exe --update        download, verify and install the newest release
 - Processes with the same name are grouped, so all `chrome.exe` processes count as one app.
 - "Disk and file I/O" comes from Windows process I/O counters, which include some non-disk I/O.
 - GPU usage is not tracked yet.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
