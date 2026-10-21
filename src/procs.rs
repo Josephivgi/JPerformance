@@ -1,8 +1,12 @@
 //! Stopping a running app. This only ends its processes; nothing is uninstalled or deleted.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-use windows_sys::Win32::Foundation::{HWND, LPARAM};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WAIT_TIMEOUT};
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GW_OWNER, GetWindow, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
     PostMessageW, WM_CLOSE,
@@ -73,7 +77,9 @@ pub fn window_titles() -> HashMap<u32, Vec<String>> {
 }
 
 pub enum StopResult {
-    /// The app has windows and was asked to close, like clicking X. It may ask to save first.
+    /// The app closed itself after being asked, like clicking X.
+    Closed,
+    /// It was asked to close but still has a window open, often a "save changes?" prompt.
     AskedToClose,
     /// Its processes were ended.
     Ended(usize),
@@ -83,8 +89,37 @@ pub enum StopResult {
     Protected,
 }
 
+/// How long an app gets to close its windows when asked.
+const CLOSE_WAIT: Duration = Duration::from_secs(6);
+/// How long processes may keep running after their windows are gone before they are ended.
+/// Apps that hide in the tray on close (Discord, Lunar Client, most Electron apps) never exit on their own.
+const EXIT_GRACE: Duration = Duration::from_secs(2);
+
+/// A process of the app being stopped, held open so a reused process id cannot be hit by mistake.
+struct Proc {
+    pid: u32,
+    parent: Option<u32>,
+    handle: HANDLE,
+}
+
+impl Proc {
+    fn alive(&self) -> bool {
+        unsafe { WaitForSingleObject(self.handle, 0) == WAIT_TIMEOUT }
+    }
+}
+
+impl Drop for Proc {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
 /// Stops every process of `app`. Without `force`, apps with windows are asked
-/// to close so they can save; background processes are ended either way.
+/// to close first so they can save. If the windows go away but the processes keep
+/// running (the app went to the tray), or the app has no windows, its processes are ended.
+/// Blocks for up to a few seconds, so call it off the UI thread.
 pub fn stop(app: &str, force: bool) -> StopResult {
     let mut sys = System::new();
     sys.refresh_processes_specifics(
@@ -92,24 +127,36 @@ pub fn stop(app: &str, force: bool) -> StopResult {
         true,
         ProcessRefreshKind::nothing().with_exe(UpdateKind::OnlyIfNotSet),
     );
-    let procs: Vec<&sysinfo::Process> = sys
+    let matching: Vec<&sysinfo::Process> = sys
         .processes()
         .values()
         .filter(|p| p.name().to_string_lossy() == app)
         .collect();
-    if procs.is_empty() {
+    if matching.is_empty() {
         return StopResult::NotRunning;
     }
-    let exe = procs.iter().find_map(|p| p.exe()).map(|e| e.display().to_string());
+    let exe = matching.iter().find_map(|p| p.exe()).map(|e| e.display().to_string());
     if is_protected(app, exe.as_deref()) {
         return StopResult::Protected;
+    }
+    // Processes Windows will not open for us (usually elevated ones) are skipped.
+    let procs: Vec<Proc> = matching
+        .iter()
+        .filter_map(|p| {
+            let pid = p.pid().as_u32();
+            let handle = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid) };
+            (!handle.is_null()).then(|| Proc { pid, parent: p.parent().map(|p| p.as_u32()), handle })
+        })
+        .collect();
+    if procs.is_empty() {
+        return StopResult::Denied;
     }
 
     if !force {
         let windows = visible_windows();
         let mut asked = false;
         for p in &procs {
-            for &hwnd in windows.get(&p.pid().as_u32()).into_iter().flatten() {
+            for &hwnd in windows.get(&p.pid).into_iter().flatten() {
                 unsafe {
                     PostMessageW(hwnd, WM_CLOSE, 0, 0);
                 }
@@ -117,11 +164,50 @@ pub fn stop(app: &str, force: bool) -> StopResult {
             }
         }
         if asked {
-            return StopResult::AskedToClose;
+            let start = Instant::now();
+            let mut hidden_since: Option<Instant> = None;
+            loop {
+                std::thread::sleep(Duration::from_millis(250));
+                if !procs.iter().any(Proc::alive) {
+                    return StopResult::Closed;
+                }
+                let windows = visible_windows();
+                let has_window = procs.iter().any(|p| p.alive() && windows.contains_key(&p.pid));
+                if has_window {
+                    hidden_since = None;
+                    if start.elapsed() >= CLOSE_WAIT {
+                        return StopResult::AskedToClose;
+                    }
+                } else if hidden_since.get_or_insert_with(Instant::now).elapsed() >= EXIT_GRACE {
+                    break;
+                }
+            }
         }
     }
 
-    match procs.iter().filter(|p| p.kill()).count() {
+    end_all(&procs)
+}
+
+/// Ends the processes, top-level ones first so a parent cannot restart its children.
+fn end_all(procs: &[Proc]) -> StopResult {
+    let pids: HashSet<u32> = procs.iter().map(|p| p.pid).collect();
+    let (roots, children): (Vec<&Proc>, Vec<&Proc>) =
+        procs.iter().partition(|p| p.parent.is_none_or(|parent| !pids.contains(&parent)));
+    for p in roots.into_iter().chain(children) {
+        if p.alive() {
+            unsafe {
+                TerminateProcess(p.handle, 1);
+            }
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    for p in procs {
+        let left = deadline.saturating_duration_since(Instant::now()).as_millis() as u32;
+        unsafe {
+            WaitForSingleObject(p.handle, left);
+        }
+    }
+    match procs.iter().filter(|p| !p.alive()).count() {
         0 => StopResult::Denied,
         n => StopResult::Ended(n),
     }

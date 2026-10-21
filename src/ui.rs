@@ -6,6 +6,7 @@ use eframe::egui::{self, Color32, RichText, Sense, Stroke, Ui, vec2};
 use egui_plot::{Line, Plot, PlotPoints, Points, VLine};
 use rusqlite::Connection;
 use std::collections::HashMap;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 pub fn run() -> Result<(), String> {
@@ -80,6 +81,19 @@ enum AppSort {
     Io,
 }
 
+/// Where stopping an app from the Running apps page is at.
+enum StopState {
+    /// Waiting for it to close.
+    Closing,
+    /// It kept a window open after being asked, so offer Force stop.
+    StillOpen,
+    /// It closed or was ended; it stays hidden until the list catches up.
+    Done(Instant),
+}
+
+/// A finished stop: app, display name, result.
+type StopDone = (String, String, procs::StopResult);
+
 /// A clicked point in time and what was happening then.
 struct Moment {
     from: i64,
@@ -134,8 +148,10 @@ struct App {
     run_filter: String,
     run_sort: RunSort,
     run_notice: Option<(String, bool)>,
-    /// When each app was last asked to stop.
-    stops: HashMap<String, Instant>,
+    /// Apps being stopped, or recently stopped.
+    stops: HashMap<String, StopState>,
+    stop_tx: mpsc::Sender<StopDone>,
+    stop_rx: mpsc::Receiver<StopDone>,
     confirm_force: Option<String>,
     hist_app: Option<String>,
     hist_series: Vec<db::AppPoint>,
@@ -169,6 +185,7 @@ impl App {
         }
         autostart::refresh_path();
         update::cleanup_after_update();
+        let (stop_tx, stop_rx) = mpsc::channel();
         Ok(Self {
             updater: Updater::new(),
             update_installing: false,
@@ -200,6 +217,8 @@ impl App {
             run_sort: RunSort::Memory,
             run_notice: None,
             stops: HashMap::new(),
+            stop_tx,
+            stop_rx,
             confirm_force: None,
             hist_app: None,
             hist_series: Vec::new(),
@@ -430,6 +449,7 @@ fn moment_row(ui: &mut Ui, t: &Tokens, app: &str, desc: Option<&str>, value: &st
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.refresh();
+        self.poll_stops();
         ui.ctx().request_repaint_after(Duration::from_secs(2));
         let t = theme::tokens(ui.ctx());
         self.updater.tick(ui.ctx());
@@ -1552,27 +1572,52 @@ impl App {
         }
     }
 
-    fn stop_app(&mut self, app: &str, force: bool) {
+    /// Stops `app` on a background thread; closing can take a few seconds.
+    fn stop_app(&mut self, ctx: &egui::Context, app: &str, force: bool) {
         let desc = self.live.iter().find(|r| r.app == app).and_then(|r| r.description.clone());
         let name = describe::display_name(app, desc.as_deref());
-        let (msg, is_err) = match procs::stop(app, force) {
-            procs::StopResult::AskedToClose => (
-                format!("Asked {name} to close. If it has unsaved work, it may ask you to save first."),
-                false,
-            ),
-            procs::StopResult::Ended(n) => {
-                (format!("Stopped {name} ({n} process{}).", if n == 1 { "" } else { "es" }), false)
-            }
-            procs::StopResult::NotRunning => (format!("{name} is not running anymore."), false),
-            procs::StopResult::Denied => (
-                format!("Windows did not let JPerformance stop {name}. It may be running as administrator."),
-                true,
-            ),
-            procs::StopResult::Protected => (format!("{name} is part of Windows, so JPerformance does not stop it."), true),
-        };
-        self.run_notice = Some((msg, is_err));
-        self.stops.insert(app.to_string(), Instant::now());
-        self.last_live = None;
+        self.stops.insert(app.to_string(), StopState::Closing);
+        self.run_notice = Some((format!("Closing {name}..."), false));
+        let (tx, ctx, app) = (self.stop_tx.clone(), ctx.clone(), app.to_string());
+        std::thread::spawn(move || {
+            let result = procs::stop(&app, force);
+            let _ = tx.send((app, name, result));
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_stops(&mut self) {
+        while let Ok((app, name, result)) = self.stop_rx.try_recv() {
+            let (msg, is_err, state) = match result {
+                procs::StopResult::Closed => (format!("Closed {name}."), false, StopState::Done(Instant::now())),
+                procs::StopResult::AskedToClose => (
+                    format!("Asked {name} to close, but it still has a window open. It may be asking you to save. Use Force stop if it is stuck."),
+                    false,
+                    StopState::StillOpen,
+                ),
+                procs::StopResult::Ended(n) => (
+                    format!("Stopped {name} ({n} process{}).", if n == 1 { "" } else { "es" }),
+                    false,
+                    StopState::Done(Instant::now()),
+                ),
+                procs::StopResult::NotRunning => {
+                    (format!("{name} is not running anymore."), false, StopState::Done(Instant::now()))
+                }
+                procs::StopResult::Denied => (
+                    format!("Windows did not let JPerformance stop {name}. It may be running as administrator."),
+                    true,
+                    StopState::StillOpen,
+                ),
+                procs::StopResult::Protected => {
+                    self.stops.remove(&app);
+                    self.run_notice = Some((format!("{name} is part of Windows, so JPerformance does not stop it."), true));
+                    continue;
+                }
+            };
+            self.run_notice = Some((msg, is_err));
+            self.stops.insert(app, state);
+            self.last_live = None;
+        }
     }
 
     fn page_running(&mut self, ui: &mut Ui, t: &Tokens) {
@@ -1656,11 +1701,14 @@ impl App {
                         ui.label(RichText::new("Part of Windows").small().color(t.muted))
                             .on_hover_text("JPerformance does not stop Windows system processes.");
                     } else {
-                        match self.stops.get(&r.app).map(|at| at.elapsed()) {
-                            Some(e) if e < Duration::from_secs(8) => {
+                        match self.stops.get(&r.app) {
+                            Some(StopState::Closing) => {
                                 ui.label(RichText::new("Closing").color(t.text_2));
                             }
-                            Some(_) => {
+                            Some(StopState::Done(_)) => {
+                                ui.label(RichText::new("Stopped").color(t.text_2));
+                            }
+                            Some(StopState::StillOpen) => {
                                 if ui
                                     .button(RichText::new("Force stop").color(t.critical))
                                     .on_hover_text("It is still running. Ends it right away; unsaved work is lost.")
@@ -1686,7 +1734,7 @@ impl App {
             });
         });
         if let Some(app) = stop {
-            self.stop_app(&app, false);
+            self.stop_app(ui.ctx(), &app, false);
         }
         if let Some(app) = force {
             self.confirm_force = Some(app);
@@ -1694,9 +1742,14 @@ impl App {
         if let Some(app) = track {
             self.start_tracking(&app);
         }
-        // Forget stop attempts for apps that have closed.
+        // Forget stops for apps that are gone. A stopped app that still shows after a while
+        // (the list lags a few seconds, or it was restarted) gets its buttons back.
         let running: std::collections::HashSet<&str> = self.live.iter().map(|r| r.app.as_str()).collect();
-        self.stops.retain(|app, at| running.contains(app.as_str()) || at.elapsed() < Duration::from_secs(8));
+        self.stops.retain(|app, s| match s {
+            StopState::Closing => true,
+            StopState::StillOpen => running.contains(app.as_str()),
+            StopState::Done(at) => running.contains(app.as_str()) && at.elapsed() < Duration::from_secs(10),
+        });
     }
 
     fn force_dialog(&mut self, ui: &mut Ui, t: &Tokens) {
@@ -1710,7 +1763,7 @@ impl App {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if ui.button(RichText::new("Force stop").color(t.critical)).clicked() {
-                    self.stop_app(&app, true);
+                    self.stop_app(ui.ctx(), &app, true);
                     self.confirm_force = None;
                 }
                 if ui.button("Cancel").clicked() {

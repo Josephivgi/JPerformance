@@ -76,7 +76,8 @@ fn main() {
             };
             let force = args.get(2).is_some_and(|a| a == "--force");
             let msg = match procs::stop(app, force) {
-                procs::StopResult::AskedToClose => "asked to close".to_string(),
+                procs::StopResult::Closed => "closed".to_string(),
+                procs::StopResult::AskedToClose => "asked to close, but a window is still open".to_string(),
                 procs::StopResult::Ended(n) => format!("stopped {n} process(es)"),
                 procs::StopResult::NotRunning => "not running".to_string(),
                 procs::StopResult::Denied => "Windows refused (it may run as administrator)".to_string(),
