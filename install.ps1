@@ -37,10 +37,18 @@ $NoPin = [bool]$env:JSYSTEMS_NOPIN
 Remove-Item Env:JSYSTEMS_APPS, Env:JSYSTEMS_NOPIN -ErrorAction SilentlyContinue
 
 function Get-Release($app) {
-  $rel = Invoke-RestMethod "https://api.github.com/repos/$Owner/$($app.Repo)/releases/latest" -Headers @{ 'User-Agent' = 'jsystems-install' }
-  $asset = $rel.assets | Where-Object name -eq $app.Asset | Select-Object -First 1
-  if (-not $asset) { throw "$($app.Asset) is missing from $($app.Repo) $($rel.tag_name)" }
-  [pscustomobject]@{ Tag = $rel.tag_name; Url = $asset.browser_download_url; Digest = $asset.digest }
+  # Newest published release that has the file. A brand-new release can be
+  # missing it for a few minutes while GitHub Actions builds the setup.
+  $all = Invoke-RestMethod "https://api.github.com/repos/$Owner/$($app.Repo)/releases?per_page=10" -Headers @{ 'User-Agent' = 'jsystems-install' }
+  $all = @($all | Where-Object { -not $_.draft -and -not $_.prerelease })
+  foreach ($rel in $all) {
+    $asset = $rel.assets | Where-Object name -eq $app.Asset | Select-Object -First 1
+    if ($asset) {
+      if ($rel.tag_name -ne $all[0].tag_name) { Write-Host "  ($($all[0].tag_name) is still being built, using $($rel.tag_name))" -NoNewline }
+      return [pscustomobject]@{ Tag = $rel.tag_name; Url = $asset.browser_download_url; Digest = $asset.digest }
+    }
+  }
+  throw "no release of $($app.Repo) has $($app.Asset)"
 }
 
 function Save-Asset($release, $dest) {
