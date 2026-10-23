@@ -16,6 +16,20 @@ Task Manager shows the last minute. JPerformance keeps a history.
 
 All data stays on your PC in `%APPDATA%\JPerformance\jperformance.db` (SQLite). It takes a sample every 5 seconds and removes history older than 30 days automatically. There are no settings to manage. History recorded under the old name (PerfLens) is copied over the first time JPerformance starts.
 
+## Install on Windows
+
+Open PowerShell and run:
+
+```powershell
+irm https://raw.githubusercontent.com/Josephivgi/JPerformance/master/install.ps1 | iex
+```
+
+It downloads the latest release from GitHub, adds it to the Start Menu, and pins it to the taskbar. No administrator rights are needed, and Windows does not show the "Windows protected your PC" warning. To install every JSystems app (Simple Recorder, JAgents, JPerformance, JServer) at once:
+
+```powershell
+$env:JSYSTEMS_APPS='all'; irm https://raw.githubusercontent.com/Josephivgi/JPerformance/master/install.ps1 | iex
+```
+
 ## Download and updates
 
 Download `JPerformance.exe` from the [latest release](https://github.com/Josephivgi/JPerformance/releases/latest) and run it from a folder you can write to (Desktop, Documents, or a folder of your own, not Program Files).
