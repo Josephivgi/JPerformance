@@ -54,9 +54,14 @@ function Get-Release($app) {
 function Save-Asset($release, $dest) {
   Invoke-WebRequest $release.Url -OutFile $dest -UseBasicParsing -Headers @{ 'User-Agent' = 'jsystems-install' }
   # GitHub publishes a sha256 for each asset; refuse a download that does not match.
+  # .NET directly: Get-FileHash is a script function in Windows PowerShell 5.1 and
+  # does not load on some locked-down accounts.
   if ($release.Digest -match '^sha256:(.+)$') {
-    $hash = (Get-FileHash $dest -Algorithm SHA256).Hash
-    if ($hash -ne $Matches[1]) { throw "checksum mismatch for $(Split-Path $dest -Leaf)" }
+    $want = $Matches[1]
+    $stream = [IO.File]::OpenRead($dest)
+    try { $hash = -join ([Security.Cryptography.SHA256]::Create().ComputeHash($stream) | ForEach-Object { $_.ToString('x2') }) }
+    finally { $stream.Dispose() }
+    if ($hash -ne $want) { throw "checksum mismatch for $(Split-Path $dest -Leaf)" }
   }
   Unblock-File $dest
 }
@@ -142,14 +147,38 @@ $pins
   </CustomTaskbarLayoutCollection>
 </LayoutModificationTemplate>
 "@ | Set-Content $layout -Encoding UTF8
-  New-Item $key -Force | Out-Null
-  Set-ItemProperty $key StartLayoutFile $layout -Type ExpandString
-  Set-ItemProperty $key LockedStartLayout 1 -Type DWord
+
+  # Only admins can write under Software\Policies, even in HKCU. The layout file
+  # above is the user's own, so once the policy points at it later runs need no
+  # permission. The first run asks once, and writes to this user's hive by SID
+  # so it still lands here if a different admin account approves the prompt.
+  $policy = Get-ItemProperty $key -ErrorAction SilentlyContinue
+  if ($policy.StartLayoutFile -ne $layout -or $policy.LockedStartLayout -ne 1) {
+    Write-Host '  Windows will ask once for permission to add taskbar pins.'
+    $hive = "Registry::HKEY_USERS\$([Security.Principal.WindowsIdentity]::GetCurrent().User.Value)\Software\Policies\Microsoft\Windows\Explorer"
+    $set = "`$k = '$hive'; if (-not (Test-Path `$k)) { New-Item `$k -Force | Out-Null }; " +
+      "Set-ItemProperty `$k StartLayoutFile '$layout' -Type ExpandString; Set-ItemProperty `$k LockedStartLayout 1 -Type DWord"
+    $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($set))
+    try {
+      Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -Wait -ArgumentList '-NoProfile', '-EncodedCommand', $enc
+    } catch {
+      Write-Host '  skipped: permission was not given. The apps are installed; pin them from the Start Menu.' -ForegroundColor Yellow
+      return
+    }
+    $policy = Get-ItemProperty $key -ErrorAction SilentlyContinue
+    if ($policy.StartLayoutFile -ne $layout) {
+      Write-Host '  skipped: the taskbar setting could not be saved. Pin the apps from the Start Menu.' -ForegroundColor Yellow
+      return
+    }
+  }
+
   # Explorer applies the layout when it starts; this briefly redraws the taskbar.
+  # Windows restarts Explorer on its own. Starting it from here is a last resort,
+  # since an Explorer started by an admin window would itself run as admin.
   Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force
-  Start-Sleep -Seconds 2
+  for ($i = 0; $i -lt 20 -and -not (Get-Process explorer -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Milliseconds 500 }
   if (-not (Get-Process explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }
-  Write-Host "  $($all -join ', ') added to the taskbar layout. If one is missing, sign out and back in." -ForegroundColor Green
+  Write-Host "  $($all -join ', ') added to the taskbar." -ForegroundColor Green
 }
 
 Write-Host 'Installing JSystems apps from GitHub Releases'
@@ -158,7 +187,8 @@ foreach ($app in $Apps) { if (Install-App $app) { $done += $app.Name } }
 
 if ($done -and -not $NoPin) {
   Write-Host 'Pinning to the taskbar'
-  Set-TaskbarPins $done
+  try { Set-TaskbarPins $done }
+  catch { Write-Host "  skipped: $($_.Exception.Message) Pin the apps from the Start Menu." -ForegroundColor Yellow }
 }
 if (-not $Apps) { Write-Host 'No app matched JSYSTEMS_APPS. Use all, or names like JAgents,JServer.' -ForegroundColor Red }
 Write-Host "Done. $($done.Count) of $($Apps.Count) apps installed."
