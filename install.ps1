@@ -1,10 +1,11 @@
 <#
   JSystems installer: installs the latest release of JSystems apps straight
   from GitHub Releases and pins them to the Windows taskbar. The same file
-  is in each app's repo; on its own it installs that repo's app.
+  is in each app's repo. It asks yes or no for each app, then installs the
+  ones you picked.
 
-    This app:      irm https://raw.githubusercontent.com/Josephivgi/JPerformance/master/install.ps1 | iex
-    Every app:     $env:JSYSTEMS_APPS='all'; irm <same url> | iex
+    Ask:           irm https://raw.githubusercontent.com/Josephivgi/JPerformance/master/install.ps1 | iex
+    No questions:  $env:JSYSTEMS_APPS='all'; irm <same url> | iex
     Some apps:     $env:JSYSTEMS_APPS='JAgents,JServer'; irm <same url> | iex
     Skip pinning:  $env:JSYSTEMS_NOPIN='1'
     Skip the JAgents terminal app:  $env:JSYSTEMS_NOTERMINAL='1'
@@ -26,13 +27,17 @@ $StartMenu = [Environment]::GetFolderPath('Programs')
 
 # Kind 'setup': an NSIS setup run with /S. Kind 'exe': a single portable exe.
 $Apps = @(
-  @{ Name = 'Simple Recorder'; Repo = 'simple-recorder'; Asset = 'SimpleRecorder-Setup.exe'; Kind = 'setup'; Exe = 'Simple Recorder.exe' }
-  @{ Name = 'JAgents';         Repo = 'JAgents';         Asset = 'JAgents-Setup.exe';        Kind = 'setup'; Exe = 'JAgents.exe' }
-  @{ Name = 'JPerformance';    Repo = 'JPerformance';    Asset = 'JPerformance.exe';         Kind = 'exe';   Exe = 'JPerformance.exe' }
-  @{ Name = 'JServer';         Repo = 'JServer';         Asset = 'JServer.exe';              Kind = 'exe';   Exe = 'JServer.exe' }
+  @{ Name = 'Simple Recorder'; Repo = 'simple-recorder'; Asset = 'SimpleRecorder-Setup.exe'; Kind = 'setup'; Exe = 'Simple Recorder.exe'; About = 'records your screen, a window or an area to MP4' }
+  @{ Name = 'JAgents';         Repo = 'JAgents';         Asset = 'JAgents-Setup.exe';        Kind = 'setup'; Exe = 'JAgents.exe'; About = 'runs coding agents like Claude Code and Codex side by side' }
+  @{ Name = 'JPerformance';    Repo = 'JPerformance';    Asset = 'JPerformance.exe';         Kind = 'exe';   Exe = 'JPerformance.exe'; About = 'tracks CPU, memory, disk and network use over 30 days' }
+  @{ Name = 'JServer';         Repo = 'JServer';         Asset = 'JServer.exe';              Kind = 'exe';   Exe = 'JServer.exe'; About = 'watches the Linux servers in your SSH config' }
 )
-$want = if ($env:JSYSTEMS_APPS) { $env:JSYSTEMS_APPS -split ',' | ForEach-Object { $_.Trim() } } else { @($ThisApp) }
-if ($want -notcontains 'all') { $Apps = @($Apps | Where-Object { $want -contains $_.Name -or $want -contains $_.Repo }) }
+# JSYSTEMS_APPS picks apps with no questions; without it the installer asks.
+$Ask = -not $env:JSYSTEMS_APPS
+if (-not $Ask) {
+  $want = $env:JSYSTEMS_APPS -split ',' | ForEach-Object { $_.Trim() }
+  if ($want -notcontains 'all') { $Apps = @($Apps | Where-Object { $want -contains $_.Name -or $want -contains $_.Repo }) }
+}
 $NoPin = [bool]$env:JSYSTEMS_NOPIN
 $NoTerminal = [bool]$env:JSYSTEMS_NOTERMINAL
 # The variables last for the whole PowerShell session; clear them so a later run starts clean.
@@ -46,8 +51,8 @@ function Get-Release($app) {
   foreach ($rel in $all) {
     $asset = $rel.assets | Where-Object name -eq $app.Asset | Select-Object -First 1
     if ($asset) {
-      if ($rel.tag_name -ne $all[0].tag_name) { Write-Host "  ($($all[0].tag_name) is still being built, using $($rel.tag_name))" -NoNewline }
-      return [pscustomobject]@{ Tag = $rel.tag_name; Url = $asset.browser_download_url; Digest = $asset.digest; MB = [math]::Round($asset.size / 1MB) }
+      $note = if ($rel.tag_name -ne $all[0].tag_name) { "$($all[0].tag_name) is still being built, so this is $($rel.tag_name)" } else { '' }
+      return [pscustomobject]@{ Tag = $rel.tag_name; Url = $asset.browser_download_url; Digest = $asset.digest; MB = [math]::Round($asset.size / 1MB); Note = $note }
     }
   }
   throw "no release of $($app.Repo) has $($app.Asset)"
@@ -77,8 +82,45 @@ function New-Shortcut($lnk, $target) {
   $sc.Save()
 }
 
+# The installed version, or '' when the app is not installed.
+function Get-InstalledVersion($app) {
+  if ($app.Kind -eq 'setup') {
+    $entry = Get-ChildItem HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall -ErrorAction SilentlyContinue |
+      Get-ItemProperty -ErrorAction SilentlyContinue | Where-Object DisplayName -eq $app.Name | Select-Object -First 1
+    if ($entry) { return [string]$entry.DisplayVersion }
+    return ''
+  }
+  $exe = Join-Path (Join-Path $Programs $app.Name) $app.Exe
+  if (Test-Path $exe) { $v = (Get-Item $exe).VersionInfo.ProductVersion; if ($v) { return $v } else { return 'yes' } }
+  return ''
+}
+
+# One yes/no question per app. Enter means yes.
+function Select-Apps($apps) {
+  Write-Host 'JSystems apps. Answer y or n for each one (Enter = yes).'
+  Write-Host ''
+  $picked = @()
+  foreach ($app in $apps) {
+    try { $app.Release = Get-Release $app }
+    catch { Write-Host "  $($app.Name): not available right now ($($_.Exception.Message))" -ForegroundColor Yellow; continue }
+    $have = Get-InstalledVersion $app
+    $status = if (-not $have) { 'not installed' } elseif ($have -eq 'yes') { 'installed' } elseif ($have.TrimStart('v') -eq $app.Release.Tag.TrimStart('v')) { 'installed, up to date' } else { "installed: $have" }
+    Write-Host "  $($app.Name) $($app.Release.Tag), $($app.Release.MB) MB" -ForegroundColor Cyan -NoNewline
+    Write-Host " ($status)"
+    Write-Host "    $($app.About)"
+    if ($app.Release.Note) { Write-Host "    $($app.Release.Note)" -ForegroundColor Yellow }
+    do {
+      $answer = (Read-Host "    Install $($app.Name)? [Y/n]").Trim().ToLower()
+    } until ($answer -in '', 'y', 'yes', 'n', 'no')
+    if ($answer -in '', 'y', 'yes') { $picked += $app }
+    Write-Host ''
+  }
+  return $picked
+}
+
 function Install-App($app) {
-  $release = Get-Release $app
+  $release = if ($app.Release) { $app.Release } else { Get-Release $app }
+  if ($release.Note) { Write-Host "  ($($release.Note))" }
   Write-Host "  $($app.Name) $($release.Tag)" -NoNewline
   $tmp = Join-Path ([IO.Path]::GetTempPath()) ("jsystems-" + [guid]::NewGuid())
   New-Item -ItemType Directory $tmp | Out-Null
@@ -184,6 +226,18 @@ $pins
   for ($i = 0; $i -lt 20 -and -not (Get-Process explorer -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Milliseconds 500 }
   if (-not (Get-Process explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }
   Write-Host "  $($all -join ', ') added to the taskbar." -ForegroundColor Green
+}
+
+if ($Ask) {
+  # Read-Host fails where nobody can answer (a hidden or -NonInteractive
+  # PowerShell); install this repo's own app there, as before.
+  try { $Apps = @(Select-Apps $Apps) }
+  catch {
+    Write-Host "No one to answer the questions, so installing $ThisApp only. Set JSYSTEMS_APPS to choose." -ForegroundColor Yellow
+    $Apps = @($Apps | Where-Object Name -eq $ThisApp)
+  }
+  if (-not $Apps) { Write-Host 'Nothing picked, so nothing was installed.'; return }
+  Write-Host "Installing: $(($Apps | ForEach-Object Name) -join ', ')"
 }
 
 Write-Host 'Installing JSystems apps from GitHub Releases'
