@@ -140,8 +140,31 @@ function Install-App($app) {
       $dir = Join-Path $Programs $app.Name
       New-Item -ItemType Directory $dir -Force | Out-Null
       $exe = Join-Path $dir $app.Exe
+      $old = Join-Path $dir ($app.Exe -replace '\.exe$', '.old.exe')
+      Remove-Item $old -Force -ErrorAction SilentlyContinue
+      # The background recorder (--collector) has no window but keeps the exe
+      # open. Windows lets a running exe be renamed, not overwritten, so this
+      # swaps the file the way the app's own updater does, then restarts the
+      # recorder from the new exe.
+      $running = @(Get-CimInstance Win32_Process -Filter "Name='$($app.Exe)'" -ErrorAction SilentlyContinue | Where-Object ExecutablePath -eq $exe)
+      $collectors = @($running | Where-Object CommandLine -match '--collector')
+      if (Test-Path $exe) {
+        try { Rename-Item $exe $old -ErrorAction Stop }
+        catch { throw "$($app.Exe) could not be replaced: $($_.Exception.Message)" }
+      }
       try { Copy-Item $file $exe -Force }
-      catch { throw "$($app.Exe) is in use. Close $($app.Name) (and its background recorder) and run this again." }
+      catch {
+        if (Test-Path $old) { Rename-Item $old $exe -ErrorAction SilentlyContinue }
+        throw "$($app.Exe) could not be written: $($_.Exception.Message)"
+      }
+      if ($collectors) {
+        $collectors | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        Start-Process $exe -ArgumentList '--collector'
+        Write-Host ' (background recorder restarted)' -NoNewline
+      }
+      Start-Sleep -Milliseconds 500
+      Remove-Item $old -Force -ErrorAction SilentlyContinue
+      if ($running.Count -gt $collectors.Count) { Write-Host " (reopen $($app.Name) to use the new version)" -NoNewline }
       New-Shortcut (Join-Path $StartMenu "$($app.Name).lnk") $exe
     }
     Write-Host " installed in $([int]$clock.Elapsed.TotalSeconds)s" -ForegroundColor Green
