@@ -7,6 +7,7 @@
     Every app:     $env:JSYSTEMS_APPS='all'; irm <same url> | iex
     Some apps:     $env:JSYSTEMS_APPS='JAgents,JServer'; irm <same url> | iex
     Skip pinning:  $env:JSYSTEMS_NOPIN='1'
+    Skip the JAgents terminal app:  $env:JSYSTEMS_NOTERMINAL='1'
 
   Per user, no admin. Downloads are made with PowerShell, so Windows does
   not mark them as "from the internet" and SmartScreen does not stop them.
@@ -33,8 +34,9 @@ $Apps = @(
 $want = if ($env:JSYSTEMS_APPS) { $env:JSYSTEMS_APPS -split ',' | ForEach-Object { $_.Trim() } } else { @($ThisApp) }
 if ($want -notcontains 'all') { $Apps = @($Apps | Where-Object { $want -contains $_.Name -or $want -contains $_.Repo }) }
 $NoPin = [bool]$env:JSYSTEMS_NOPIN
+$NoTerminal = [bool]$env:JSYSTEMS_NOTERMINAL
 # The variables last for the whole PowerShell session; clear them so a later run starts clean.
-Remove-Item Env:JSYSTEMS_APPS, Env:JSYSTEMS_NOPIN -ErrorAction SilentlyContinue
+Remove-Item Env:JSYSTEMS_APPS, Env:JSYSTEMS_NOPIN, Env:JSYSTEMS_NOTERMINAL -ErrorAction SilentlyContinue
 
 function Get-Release($app) {
   # Newest published release that has the file. A brand-new release can be
@@ -45,7 +47,7 @@ function Get-Release($app) {
     $asset = $rel.assets | Where-Object name -eq $app.Asset | Select-Object -First 1
     if ($asset) {
       if ($rel.tag_name -ne $all[0].tag_name) { Write-Host "  ($($all[0].tag_name) is still being built, using $($rel.tag_name))" -NoNewline }
-      return [pscustomobject]@{ Tag = $rel.tag_name; Url = $asset.browser_download_url; Digest = $asset.digest }
+      return [pscustomobject]@{ Tag = $rel.tag_name; Url = $asset.browser_download_url; Digest = $asset.digest; MB = [math]::Round($asset.size / 1MB) }
     }
   }
   throw "no release of $($app.Repo) has $($app.Asset)"
@@ -82,7 +84,10 @@ function Install-App($app) {
   New-Item -ItemType Directory $tmp | Out-Null
   try {
     $file = Join-Path $tmp $app.Asset
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    Write-Host " ($($release.MB) MB) downloading..." -NoNewline
     Save-Asset $release $file
+    Write-Host ' installing...' -NoNewline
     if ($app.Kind -eq 'setup') {
       # WaitForExit, not -Wait: the setup opens the app when it finishes, and
       # -Wait would also wait for the app to close. /S setups show no window.
@@ -97,7 +102,7 @@ function Install-App($app) {
       catch { throw "$($app.Exe) is in use. Close $($app.Name) (and its background recorder) and run this again." }
       New-Shortcut (Join-Path $StartMenu "$($app.Name).lnk") $exe
     }
-    Write-Host '  installed' -ForegroundColor Green
+    Write-Host " installed in $([int]$clock.Elapsed.TotalSeconds)s" -ForegroundColor Green
     return $true
   } catch {
     Write-Host "  failed: $($_.Exception.Message)" -ForegroundColor Red
@@ -184,6 +189,23 @@ $pins
 Write-Host 'Installing JSystems apps from GitHub Releases'
 $done = @()
 foreach ($app in $Apps) { if (Install-App $app) { $done += $app.Name } }
+
+# JAgents also has a terminal app (the jagents command), installed by
+# install-terminal.ps1. It needs Node.js 22 or newer; without it the desktop
+# app is still installed and this says how to add the terminal app later.
+if ($done -contains 'JAgents' -and -not $NoTerminal) {
+  Write-Host 'Installing the JAgents terminal app'
+  $major = if (Get-Command node -ErrorAction SilentlyContinue) { [int](node -p "process.versions.node.split('.')[0]") } else { 0 }
+  if ($major -lt 22) {
+    Write-Host '  skipped: it needs Node.js 22 or newer from https://nodejs.org. Run this again after installing it.' -ForegroundColor Yellow
+  } else {
+    try {
+      Invoke-Expression (Invoke-RestMethod "https://raw.githubusercontent.com/$Owner/JAgents/main/install-terminal.ps1" -Headers @{ 'User-Agent' = 'jsystems-install' })
+    } catch {
+      Write-Host "  failed: $($_.Exception.Message)" -ForegroundColor Red
+    }
+  }
+}
 
 if ($done -and -not $NoPin) {
   Write-Host 'Pinning to the taskbar'
