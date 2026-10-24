@@ -26,9 +26,12 @@ $Programs = Join-Path $env:LOCALAPPDATA 'Programs'
 $StartMenu = [Environment]::GetFolderPath('Programs')
 
 # Kind 'setup': an NSIS setup run with /S. Kind 'exe': a single portable exe.
+# WriteRatio: how many bytes a setup writes to disk per byte of setup file,
+# measured on a full install (Simple Recorder 1.3.0: 1306 of 110 MB; JAgents
+# 0.6.2: 985 of 281 MB). The install percentage is written / expected.
 $Apps = @(
-  @{ Name = 'Simple Recorder'; Repo = 'simple-recorder'; Asset = 'SimpleRecorder-Setup.exe'; Kind = 'setup'; Exe = 'Simple Recorder.exe'; About = 'records your screen, a window or an area to MP4' }
-  @{ Name = 'JAgents';         Repo = 'JAgents';         Asset = 'JAgents-Setup.exe';        Kind = 'setup'; Exe = 'JAgents.exe'; About = 'runs coding agents like Claude Code and Codex side by side' }
+  @{ Name = 'Simple Recorder'; Repo = 'simple-recorder'; Asset = 'SimpleRecorder-Setup.exe'; Kind = 'setup'; Exe = 'Simple Recorder.exe'; WriteRatio = 11.9; About = 'records your screen, a window or an area to MP4' }
+  @{ Name = 'JAgents';         Repo = 'JAgents';         Asset = 'JAgents-Setup.exe';        Kind = 'setup'; Exe = 'JAgents.exe'; WriteRatio = 3.5; About = 'runs coding agents like Claude Code and Codex side by side' }
   @{ Name = 'JPerformance';    Repo = 'JPerformance';    Asset = 'JPerformance.exe';         Kind = 'exe';   Exe = 'JPerformance.exe'; About = 'tracks CPU, memory, disk and network use over 30 days' }
   @{ Name = 'JServer';         Repo = 'JServer';         Asset = 'JServer.exe';              Kind = 'exe';   Exe = 'JServer.exe'; About = 'watches the Linux servers in your SSH config' }
 )
@@ -58,19 +61,63 @@ function Get-Release($app) {
   throw "no release of $($app.Repo) has $($app.Asset)"
 }
 
+$ProgressEvery = 5   # seconds between progress lines
+
+# Downloads in 1 MB pieces so it can print how far along it is, and hashes as
+# it goes. GitHub publishes a sha256 for each asset; a download that does not
+# match is refused. (.NET directly: Get-FileHash is a script function in
+# Windows PowerShell 5.1 and does not load on some locked-down accounts.)
 function Save-Asset($release, $dest) {
-  Invoke-WebRequest $release.Url -OutFile $dest -UseBasicParsing -Headers @{ 'User-Agent' = 'jsystems-install' }
-  # GitHub publishes a sha256 for each asset; refuse a download that does not match.
-  # .NET directly: Get-FileHash is a script function in Windows PowerShell 5.1 and
-  # does not load on some locked-down accounts.
+  Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+  $client = New-Object System.Net.Http.HttpClient
+  $client.Timeout = [TimeSpan]::FromMinutes(30)
+  $client.DefaultRequestHeaders.UserAgent.ParseAdd('jsystems-install')
+  $sha = [Security.Cryptography.SHA256]::Create()
+  $out = $null
+  try {
+    $resp = $client.GetAsync($release.Url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+    [void]$resp.EnsureSuccessStatusCode()
+    $total = [double]$resp.Content.Headers.ContentLength
+    $in = $resp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+    $out = [IO.File]::Create($dest)
+    $buf = New-Object byte[] 1MB
+    $got = 0
+    $tick = [Diagnostics.Stopwatch]::StartNew()
+    while (($n = $in.Read($buf, 0, $buf.Length)) -gt 0) {
+      $out.Write($buf, 0, $n)
+      [void]$sha.TransformBlock($buf, 0, $n, $null, 0)
+      $got += $n
+      if ($tick.Elapsed.TotalSeconds -ge $ProgressEvery -and $total -gt 0) {
+        Write-Host ("    downloading {0}% ({1} of {2} MB)" -f [int](100 * $got / $total), [int]($got / 1MB), [int]($total / 1MB))
+        $tick.Restart()
+      }
+    }
+    [void]$sha.TransformFinalBlock($buf, 0, 0)
+  } finally {
+    if ($out) { $out.Dispose() }
+    $client.Dispose()
+  }
   if ($release.Digest -match '^sha256:(.+)$') {
-    $want = $Matches[1]
-    $stream = [IO.File]::OpenRead($dest)
-    try { $hash = -join ([Security.Cryptography.SHA256]::Create().ComputeHash($stream) | ForEach-Object { $_.ToString('x2') }) }
-    finally { $stream.Dispose() }
-    if ($hash -ne $want) { throw "checksum mismatch for $(Split-Path $dest -Leaf)" }
+    $hash = -join ($sha.Hash | ForEach-Object { $_.ToString('x2') })
+    if ($hash -ne $Matches[1]) { throw "checksum mismatch for $(Split-Path $dest -Leaf)" }
   }
   Unblock-File $dest
+}
+
+# Bytes written to disk so far by a process and everything it started. The
+# setups run hidden, so this is what shows how far an install has got.
+function Get-TreeWrites($rootId, $seen) {
+  $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+  $ids = @($rootId)
+  do {
+    $count = $ids.Count
+    $ids = @($ids + @($all | Where-Object { $ids -contains $_.ParentProcessId } | ForEach-Object ProcessId) | Select-Object -Unique)
+  } while ($ids.Count -gt $count)
+  foreach ($p in $all | Where-Object { $ids -contains $_.ProcessId }) {
+    $key = [string]$p.ProcessId
+    if (-not $seen.ContainsKey($key) -or $seen[$key] -lt [double]$p.WriteTransferCount) { $seen[$key] = [double]$p.WriteTransferCount }
+  }
+  ($seen.Values | Measure-Object -Sum).Sum
 }
 
 function New-Shortcut($lnk, $target) {
@@ -118,23 +165,34 @@ function Select-Apps($apps) {
   return $picked
 }
 
-function Install-App($app) {
+function Install-App($app, $number, $count) {
   $release = if ($app.Release) { $app.Release } else { Get-Release $app }
-  if ($release.Note) { Write-Host "  ($($release.Note))" }
-  Write-Host "  $($app.Name) $($release.Tag)" -NoNewline
+  Write-Host "[$number/$count] $($app.Name) $($release.Tag) ($($release.MB) MB)" -ForegroundColor Cyan
+  if ($release.Note) { Write-Host "    ($($release.Note))" }
   $tmp = Join-Path ([IO.Path]::GetTempPath()) ("jsystems-" + [guid]::NewGuid())
   New-Item -ItemType Directory $tmp | Out-Null
   try {
     $file = Join-Path $tmp $app.Asset
     $clock = [Diagnostics.Stopwatch]::StartNew()
-    Write-Host " ($($release.MB) MB) downloading..." -NoNewline
+    Write-Host '    downloading...'
     Save-Asset $release $file
-    Write-Host ' installing...' -NoNewline
+    Write-Host "    downloaded in $([int]$clock.Elapsed.TotalSeconds)s, installing..."
     if ($app.Kind -eq 'setup') {
-      # WaitForExit, not -Wait: the setup opens the app when it finishes, and
-      # -Wait would also wait for the app to close. /S setups show no window.
+      # Not -Wait: the setup opens the app when it finishes, and -Wait would
+      # also wait for the app to close. /S setups show no window. While it
+      # runs, print how much of what it normally writes has been written.
       $p = Start-Process $file -ArgumentList '/S' -PassThru
-      $p.WaitForExit()
+      $expected = $app.WriteRatio * (Get-Item $file).Length
+      $seen = @{}
+      $tick = [Diagnostics.Stopwatch]::StartNew()
+      while (-not $p.WaitForExit(500)) {
+        $written = Get-TreeWrites $p.Id $seen
+        if ($tick.Elapsed.TotalSeconds -ge $ProgressEvery) {
+          $pct = if ($expected -gt 0) { [math]::Min(99, [int](100 * $written / $expected)) } else { 0 }
+          Write-Host "    installing about $pct% ($([int]$clock.Elapsed.TotalSeconds)s so far)"
+          $tick.Restart()
+        }
+      }
       if ($p.ExitCode -ne 0) { throw "setup exited with code $($p.ExitCode). Close $($app.Name) and run this again." }
     } else {
       $dir = Join-Path $Programs $app.Name
@@ -160,17 +218,17 @@ function Install-App($app) {
       if ($collectors) {
         $collectors | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
         Start-Process $exe -ArgumentList '--collector'
-        Write-Host ' (background recorder restarted)' -NoNewline
+        Write-Host '    background recorder restarted'
       }
       Start-Sleep -Milliseconds 500
       Remove-Item $old -Force -ErrorAction SilentlyContinue
-      if ($running.Count -gt $collectors.Count) { Write-Host " (reopen $($app.Name) to use the new version)" -NoNewline }
+      if ($running.Count -gt $collectors.Count) { Write-Host "    reopen $($app.Name) to use the new version" }
       New-Shortcut (Join-Path $StartMenu "$($app.Name).lnk") $exe
     }
-    Write-Host " installed in $([int]$clock.Elapsed.TotalSeconds)s" -ForegroundColor Green
+    Write-Host "    installed in $([int]$clock.Elapsed.TotalSeconds)s (100%)" -ForegroundColor Green
     return $true
   } catch {
-    Write-Host "  failed: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "    failed: $($_.Exception.Message)" -ForegroundColor Red
     return $false
   } finally {
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
@@ -263,9 +321,15 @@ if ($Ask) {
   Write-Host "Installing: $(($Apps | ForEach-Object Name) -join ', ')"
 }
 
+Write-Host ''
+Write-Host 'This can take up to 10 minutes, depending on how many apps you picked and' -ForegroundColor Yellow
+Write-Host 'how busy your PC is. That is normal. It is not stuck: progress is shown' -ForegroundColor Yellow
+Write-Host "every $ProgressEvery seconds. Keep this window open until it says Done." -ForegroundColor Yellow
+Write-Host ''
 Write-Host 'Installing JSystems apps from GitHub Releases'
 $done = @()
-foreach ($app in $Apps) { if (Install-App $app) { $done += $app.Name } }
+$total = [Diagnostics.Stopwatch]::StartNew()
+for ($i = 0; $i -lt $Apps.Count; $i++) { if (Install-App $Apps[$i] ($i + 1) $Apps.Count) { $done += $Apps[$i].Name } }
 
 # JAgents also has a terminal app (the jagents command), installed by
 # install-terminal.ps1. It needs Node.js 22 or newer; without it the desktop
@@ -290,5 +354,5 @@ if ($done -and -not $NoPin) {
   catch { Write-Host "  skipped: $($_.Exception.Message) Pin the apps from the Start Menu." -ForegroundColor Yellow }
 }
 if (-not $Apps) { Write-Host 'No app matched JSYSTEMS_APPS. Use all, or names like JAgents,JServer.' -ForegroundColor Red }
-Write-Host "Done. $($done.Count) of $($Apps.Count) apps installed."
+Write-Host "Done. $($done.Count) of $($Apps.Count) apps installed in $([math]::Floor($total.Elapsed.TotalMinutes)) min $($total.Elapsed.Seconds) s."
 }
